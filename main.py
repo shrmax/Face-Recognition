@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 from typing import Dict, Optional, List
+import numpy as np
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException, APIRouter
@@ -34,17 +35,23 @@ async def lifespan(app: FastAPI):
     # 1. Connect MongoDB
     await mongo_db.connect()
     
-    # 2. Initialize FAISS Vector Index
+    # 2. Sync uploads folder & initialize FAISS Vector Index FIRST
+    if os.path.exists("./uploads"):
+        try:
+            from scripts.enroll_uploads import enroll_uploads
+            await enroll_uploads("./uploads")
+        except Exception as e:
+            logger.error(f"Error syncing uploads folder: {e}")
+
     faiss_manager.initialize()
-    if not faiss_manager.load_from_disk():
-        # Load seed profiles from MongoDB if disk index absent
-        db_profiles = await mongo_db.load_all_profiles()
-        for p in db_profiles:
-            pid = p["profile_id"]
-            for vec in p.get("embeddings", []):
-                import numpy as np
-                faiss_manager.add_vector(np.array(vec, dtype=np.float32), pid)
-        logger.info(f"Seeded FAISS index with {len(faiss_manager.faiss_ids)} vectors from MongoDB.")
+    db_profiles = await mongo_db.load_all_profiles()
+    for p in db_profiles:
+        pid = p["profile_id"]
+        name = p.get("name", pid)
+        for vec in p.get("embeddings", []):
+            faiss_manager.add_vector(np.array(vec, dtype=np.float32), pid, name)
+    faiss_manager.save_to_disk()
+    logger.info(f"Successfully loaded FAISS index with {len(faiss_manager.faiss_ids)} vectors from MongoDB ({len(db_profiles)} profiles).")
         
     # 3. Create Async Job Queue & Start Recognition Workers
     recognition_job_queue = asyncio.Queue(maxsize=100)
@@ -342,7 +349,7 @@ async def face_websocket(websocket: WebSocket, camera_id: str = Query(...), rtsp
                 })
                 frame_count += 1
                 
-            await asyncio.sleep(0.066)  # ~15 FPS WebSocket stream rate
+            await asyncio.sleep(0.033)  # ~30 FPS WebSocket stream rate
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected for camera: {camera_id}")
     except Exception as e:

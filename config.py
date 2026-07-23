@@ -33,16 +33,18 @@ class Settings(BaseSettings):
     MAX_FACES: int = 0  # 0 = unlimited face detection (100+ crowd per frame)
     
     # Sampling & Performance
-    SAMPLE_FPS: int = 6  # AI Detection & Tracking FPS
+    SAMPLE_FPS: int = 12  # AI Detection & Tracking FPS
     WATCHDOG_TIMEOUT_SECONDS: float = 5.0
+    SOCKET_MAX_WIDTH: int = 1280  # 720p max width for WebSocket streaming output
+    SOCKET_MAX_HEIGHT: int = 720  # 720p max height for WebSocket streaming output
     
     # Quality & Blur Filtering
-    MIN_BLUR_VAR: float = 100.0  # Laplacian variance threshold
-    MIN_FACE_SIZE: int = 60      # Min bounding box width/height in pixels
+    MIN_BLUR_VAR: float = 25.0   # Laplacian variance threshold
+    MIN_FACE_SIZE: int = 40      # Min bounding box width/height in pixels
     
     # FAISS Dual Thresholds & Multi-Vector Gallery
-    HIGH_CONF_THRESH: float = 0.55  # Match threshold for known profile
-    LOW_CONF_THRESH: float = 0.40   # Below this = Auto-enroll new identity
+    HIGH_CONF_THRESH: float = 0.42  # Match threshold for known profile (optimized for RTSP video)
+    LOW_CONF_THRESH: float = 0.28   # Below this = Auto-enroll new identity
     MAX_GALLERY_EMBEDDINGS: int = 5 # Max representative vectors per profile in FAISS
     
     # Cooldown & Retention Policy

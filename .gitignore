@@ -19,6 +19,7 @@ known_embeddings.pkl
 # Dataset
 Employee/
 uploads/
+crops/
 
 # IDE
 .vscode/

@@ -17,9 +17,9 @@ class StreamTrackManager:
         self.camera_id = camera_id
         # sv.ByteTrack instance for persistent object tracking
         self.byte_tracker = sv.ByteTrack(
-            track_activation_threshold=0.25,
+            track_activation_threshold=0.15,
             lost_track_buffer=30,
-            minimum_matching_threshold=0.8,
+            minimum_matching_threshold=0.3,
             frame_rate=settings.SAMPLE_FPS
         )
         # track_id -> status dict
@@ -28,8 +28,8 @@ class StreamTrackManager:
         self.track_identities: Dict[int, Dict[str, str]] = {}
         
         # Annotators for visualization overlay
-        self.box_annotator = sv.BoxAnnotator(thickness=2, color_lookup=sv.ColorLookup.TRACK)
-        self.label_annotator = sv.LabelAnnotator(text_scale=0.5, text_thickness=1, color_lookup=sv.ColorLookup.TRACK)
+        self.box_annotator = sv.BoxAnnotator(thickness=2, color_lookup=sv.ColorLookup.INDEX)
+        self.label_annotator = sv.LabelAnnotator(text_scale=0.5, text_thickness=1, color_lookup=sv.ColorLookup.INDEX)
         
         # Profile ID -> Last Event Timestamp (Visit Cooldown)
         self.profile_cooldowns: Dict[str, datetime] = {}

@@ -52,7 +52,8 @@ class StreamWorker:
         self.detector = get_face_detector()
         
         self.last_raw_frame: Optional[np.ndarray] = None
-        self.last_annotated_frame: Optional[np.ndarray] = None
+        self.active_tracked_detections = None
+        self.active_labels = []
         self.last_frame_timestamp = time.time()
         self.frame_lock = threading.Lock()
         
@@ -172,6 +173,7 @@ class StreamWorker:
             now = time.time()
             self.last_frame_timestamp = now
 
+            # Store 100% full resolution raw frame for max AI detection & recognition accuracy
             with self.frame_lock:
                 self.last_raw_frame = frame.copy()
 
@@ -194,9 +196,12 @@ class StreamWorker:
     def _run_ai_pipeline(self, frame: np.ndarray):
         """Runs SCRFD detection, ByteTrack tracking, and enqueues qualified face crops"""
         try:
-            # 1. SCRFD Face Detection
+            # 1. SCRFD Face Detection (supports 100+ crowd faces in frame)
             with detector_lock:
-                faces = self.detector.get(frame, max_num=settings.MAX_FACES)
+                if settings.MAX_FACES > 0:
+                    faces = self.detector.get(frame, max_num=settings.MAX_FACES)
+                else:
+                    faces = self.detector.get(frame)
 
             # 2. ByteTrack Tracking Update
             tracked_detections, pending_jobs = self.track_manager.update(faces, frame.shape)
@@ -218,44 +223,61 @@ class StreamWorker:
                     }
                     asyncio.run_coroutine_threadsafe(self.job_queue.put(job_data), self.loop)
                 else:
+                    logger.debug(f"[{self.camera_id}] Track #{track_id} failed quality check: {reason}")
                     # Reset state so next frame of track can retry quality check
                     if track_id in self.track_manager.track_states:
                         del self.track_manager.track_states[track_id]
 
-            # 4. Render Annotations Overlay
-            annotated_frame = frame.copy()
+            # 4. Save active tracking overlays
+            labels = []
             if tracked_detections.tracker_id is not None and len(tracked_detections.tracker_id) > 0:
-                labels = []
                 for tid in tracked_detections.tracker_id:
                     tid_int = int(tid)
                     ident = self.track_manager.track_identities.get(tid_int, {})
                     labels.append(ident.get("label", f"Track #{tid_int}"))
 
-                annotated_frame = self.track_manager.box_annotator.annotate(
-                    scene=annotated_frame,
-                    detections=tracked_detections
-                )
-                annotated_frame = self.track_manager.label_annotator.annotate(
-                    scene=annotated_frame,
-                    detections=tracked_detections,
-                    labels=labels
-                )
-
             with self.frame_lock:
-                self.last_annotated_frame = np.asarray(annotated_frame)
+                self.active_tracked_detections = tracked_detections
+                self.active_labels = labels
 
         except Exception as e:
             logger.error(f"[{self.camera_id}] Error in AI pipeline: {e}")
 
     def get_latest_frame_b64(self) -> Optional[str]:
         with self.frame_lock:
-            frame = self.last_annotated_frame if self.last_annotated_frame is not None else self.last_raw_frame
-            if frame is None:
+            if self.last_raw_frame is None:
                 return None
-            frame_copy = frame.copy()
+            frame_copy = self.last_raw_frame.copy()
+            active_detections = self.active_tracked_detections
+            active_labels = self.active_labels
 
         try:
-            _, buffer = cv2.imencode('.jpg', frame_copy, [cv2.IMWRITE_JPEG_QUALITY, 50])
+            # Annotate tracking bounding boxes onto the latest 30 FPS live frame
+            if active_detections is not None and len(active_detections) > 0:
+                if active_detections.tracker_id is not None and len(active_detections.tracker_id) == len(active_detections):
+                    labels_to_render = active_labels
+                else:
+                    labels_to_render = ["Detecting..."] * len(active_detections)
+
+                frame_copy = self.track_manager.box_annotator.annotate(
+                    scene=frame_copy,
+                    detections=active_detections
+                )
+                frame_copy = self.track_manager.label_annotator.annotate(
+                    scene=frame_copy,
+                    detections=active_detections,
+                    labels=labels_to_render
+                )
+                frame_copy = np.asarray(frame_copy)
+
+            # Downscale ONLY the WebSocket stream output frame to 480p (SOCKET_MAX_WIDTH/HEIGHT)
+            if settings.SOCKET_MAX_WIDTH > 0 and settings.SOCKET_MAX_HEIGHT > 0:
+                h_f, w_f = frame_copy.shape[:2]
+                if w_f > settings.SOCKET_MAX_WIDTH or h_f > settings.SOCKET_MAX_HEIGHT:
+                    scale = min(settings.SOCKET_MAX_WIDTH / w_f, settings.SOCKET_MAX_HEIGHT / h_f)
+                    frame_copy = cv2.resize(frame_copy, (int(w_f * scale), int(h_f * scale)), interpolation=cv2.INTER_AREA)
+
+            _, buffer = cv2.imencode('.jpg', frame_copy, [cv2.IMWRITE_JPEG_QUALITY, 55])
             import base64
             return base64.b64encode(buffer).decode('utf-8')
         except Exception as e:

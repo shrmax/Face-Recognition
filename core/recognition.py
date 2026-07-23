@@ -19,14 +19,16 @@ class FAISSIndexManager:
         self.dimension = 512
         self.index: Optional[faiss.Index] = None
         self.faiss_ids: List[str] = []
+        self.profile_names: Dict[str, str] = {}
         self.lock = threading.Lock()
 
     def initialize(self):
         with self.lock:
             self.index = faiss.IndexFlatIP(self.dimension)
             self.faiss_ids = []
+            self.profile_names = {}
 
-    def add_vector(self, embedding: np.ndarray, profile_id: str):
+    def add_vector(self, embedding: np.ndarray, profile_id: str, name: Optional[str] = None):
         """Adds a single normalized vector to FAISS index"""
         with self.lock:
             if self.index is None:
@@ -34,6 +36,12 @@ class FAISSIndexManager:
             norm_vector = embedding / np.linalg.norm(embedding)
             self.index.add(norm_vector.reshape(1, -1))
             self.faiss_ids.append(profile_id)
+            if name:
+                self.profile_names[profile_id] = name
+
+    def get_name(self, profile_id: str) -> str:
+        with self.lock:
+            return self.profile_names.get(profile_id, profile_id)
 
     def search(self, query_embedding: np.ndarray) -> Tuple[float, str]:
         """Searches query vector against FAISS index. Returns (similarity, profile_id)"""
@@ -56,7 +64,7 @@ class FAISSIndexManager:
             if self.index is not None:
                 faiss.write_index(self.index, settings.FAISS_INDEX_PATH)
                 with open(settings.KNOWN_IDS_PATH, 'wb') as f:
-                    pickle.dump(self.faiss_ids, f)
+                    pickle.dump({"ids": self.faiss_ids, "names": self.profile_names}, f)
 
     def load_from_disk(self):
         with self.lock:
@@ -64,7 +72,13 @@ class FAISSIndexManager:
                 try:
                     self.index = faiss.read_index(settings.FAISS_INDEX_PATH)
                     with open(settings.KNOWN_IDS_PATH, 'rb') as f:
-                        self.faiss_ids = pickle.load(f)
+                        data = pickle.load(f)
+                        if isinstance(data, dict):
+                            self.faiss_ids = data.get("ids", [])
+                            self.profile_names = data.get("names", {})
+                        else:
+                            self.faiss_ids = data
+                            self.profile_names = {}
                     logger.info(f"Loaded FAISS index from disk ({len(self.faiss_ids)} total vectors).")
                     return True
                 except Exception as e:
@@ -116,13 +130,14 @@ class RecognitionWorker:
         if sim >= settings.HIGH_CONF_THRESH:
             # Match Known Profile
             in_cooldown = stream_worker.track_manager.check_visit_cooldown(best_profile_id)
-            label = f"{best_profile_id} ({sim:.2f})"
+            name = faiss_manager.get_name(best_profile_id)
+            label = f"#{track_id} {name} ({sim:.2f})"
             stream_worker.track_manager.set_track_identity(track_id, best_profile_id, label, is_new_visit=not in_cooldown)
 
             # Progressive Learning: If sim is between 0.55 and 0.85, add vector to multi-vector gallery
             if settings.HIGH_CONF_THRESH <= sim < 0.85:
-                faiss_manager.add_vector(emb, best_profile_id)
-                await mongo_db.save_or_update_profile(best_profile_id, emb.tolist())
+                faiss_manager.add_vector(emb, best_profile_id, name)
+                await mongo_db.save_or_update_profile(best_profile_id, emb.tolist(), name)
 
             if not in_cooldown:
                 event_doc = {
@@ -137,11 +152,12 @@ class RecognitionWorker:
                     "review_required": False
                 }
                 await mongo_db.save_detection_event(event_doc)
-                logger.info(f"[{camera_id}] KNOWN_IDENTITY Logged: {best_profile_id} ({sim:.2f})")
+                logger.info(f"[{camera_id}] KNOWN_IDENTITY Logged: Track #{track_id} {name} ({sim:.2f})")
 
         elif settings.LOW_CONF_THRESH <= sim < settings.HIGH_CONF_THRESH:
             # Uncertain / Review Candidate
-            label = f"Review ({sim:.2f})"
+            name = faiss_manager.get_name(best_profile_id)
+            label = f"#{track_id} {name}? ({sim:.2f})"
             stream_worker.track_manager.set_track_identity(track_id, "Review_Required", label, is_new_visit=True)
 
             event_doc = {
@@ -156,17 +172,17 @@ class RecognitionWorker:
                 "review_required": True
             }
             await mongo_db.save_detection_event(event_doc)
-            logger.info(f"[{camera_id}] UNCERTAIN Logged: {best_profile_id} ({sim:.2f})")
+            logger.info(f"[{camera_id}] UNCERTAIN Logged: Track #{track_id} {name} ({sim:.2f})")
 
         else:
             # Auto-Enroll New Identity (sim < 0.40)
             self.counter += 1
             new_profile_id = f"VISITOR_{now.strftime('%m%d')}_{self.counter}"
-            label = f"{new_profile_id} ({sim:.2f})"
+            label = f"#{track_id} {new_profile_id} ({sim:.2f})"
             
             # Save new vector to FAISS and MongoDB
-            faiss_manager.add_vector(emb, new_profile_id)
-            await mongo_db.save_or_update_profile(new_profile_id, emb.tolist())
+            faiss_manager.add_vector(emb, new_profile_id, new_profile_id)
+            await mongo_db.save_or_update_profile(new_profile_id, emb.tolist(), new_profile_id)
 
             stream_worker.track_manager.set_track_identity(track_id, new_profile_id, label, is_new_visit=True)
             
@@ -185,7 +201,7 @@ class RecognitionWorker:
                 "review_required": False
             }
             await mongo_db.save_detection_event(event_doc)
-            logger.info(f"[{camera_id}] NEW_IDENTITY Auto-Enrolled & Logged: {new_profile_id}")
+            logger.info(f"[{camera_id}] NEW_IDENTITY Auto-Enrolled & Logged: Track #{track_id} {new_profile_id}")
 
         # Persist FAISS index periodically
         faiss_manager.save_to_disk()
