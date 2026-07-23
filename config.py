@@ -26,10 +26,10 @@ class Settings(BaseSettings):
     KNOWN_IDS_PATH: str = "known_ids.pkl"
     EMBEDDINGS_PATH: str = "known_embeddings.pkl"
     
-    # SCRFD Face Detection Parameters
-    DET_WIDTH: int = 640
-    DET_HEIGHT: int = 640
-    DET_THRESH: float = 0.3
+    # SCRFD Face Detection Parameters (tuned for wide-angle overhead CCTV camera feeds)
+    DET_WIDTH: int = 1280
+    DET_HEIGHT: int = 1280
+    DET_THRESH: float = 0.20
     MAX_FACES: int = 0  # 0 = unlimited face detection (100+ crowd per frame)
     
     # Sampling & Performance
@@ -39,8 +39,8 @@ class Settings(BaseSettings):
     SOCKET_MAX_HEIGHT: int = 720  # 720p max height for WebSocket streaming output
     
     # Quality & Blur Filtering
-    MIN_BLUR_VAR: float = 25.0   # Laplacian variance threshold
-    MIN_FACE_SIZE: int = 40      # Min bounding box width/height in pixels
+    MIN_BLUR_VAR: float = 15.0   # Laplacian variance threshold
+    MIN_FACE_SIZE: int = 12      # Min bounding box width/height in pixels for small distant faces
     
     # FAISS Dual Thresholds & Multi-Vector Gallery
     HIGH_CONF_THRESH: float = 0.42  # Match threshold for known profile (optimized for RTSP video)
