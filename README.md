@@ -1,314 +1,260 @@
-# 🚀 Real-Time Face Recognition System using InsightFace & FAISS
+# 🚀 Real-Time Face Recognition System using InsightFace, FAISS & MongoDB
 
-A production-ready real-time face recognition system built using **FastAPI**, **InsightFace**, **FAISS**, and **OpenCV**. The system performs high-speed face detection and recognition from RTSP camera streams using GPU acceleration and streams live recognition results through WebSocket communication.
+A production-ready, high-performance real-time face recognition system built with **FastAPI**, **InsightFace (SCRFD + ArcFace)**, **FAISS**, **MongoDB**, and **OpenCV**.
+
+The system captures multi-camera RTSP video streams, executes GPU/CPU accelerated face detection and feature extraction, performs vector similarity searches with FAISS, logs events into MongoDB with retention management, and streams real-time recognition results over WebSockets and an interactive HTML web dashboard.
 
 ---
 
 ## 📌 Overview
 
-This project is designed for enterprise-grade face recognition applications including:
+This project is tailored for scalable enterprise face recognition applications, including:
 
-- Employee Attendance System
-- Smart Access Control
-- Office Security
-- Visitor Management
-- Surveillance Systems
-- Multi-Camera Face Recognition
+- Smart Access Control & Entrance Monitoring
+- Automated Employee Attendance Tracking
+- Perimeter Security & Real-Time Alerts
+- Multi-Camera Surveillance Systems
+- Visitor Identification & VIP Recognition
 
-The system automatically generates face embeddings from registered videos, builds a FAISS vector database, and recognizes known individuals in real time with low latency.
+The system includes automatic dataset enrollment, multi-vector gallery profiling, face quality/blur filtering, multi-person tracking with visit cooldowns, and automatic RTSP stream reconnection.
 
-> **Note:** Employee videos, images, embeddings, and FAISS index files are intentionally excluded from this repository for privacy and security. Users can create their own dataset by adding videos to the configured directory.
-
----
-
-# ✨ Features
-
-- 🎯 Real-Time Face Detection & Recognition
-- 🚀 GPU Accelerated InsightFace Inference
-- 📡 RTSP Camera Streaming
-- 🔍 FAISS Vector Similarity Search
-- ⚡ FastAPI REST APIs
-- 📺 WebSocket Live Streaming
-- 🔄 Automatic Face Database Reload
-- 👤 Multi-Person Recognition
-- 🔁 Automatic RTSP Reconnection
-- ⏱ Recognition Cooldown
-- 🧵 Multi-threaded Processing
-- 📊 Health Check Endpoint
-- 💻 Supports both GPU (CUDA) and CPU execution depending on the installed ONNX Runtime provider.
+> **Note:** Dataset folders (`uploads/`, `crops/`), FAISS binary index files (`faiss_index.bin`), and identity pkl files are excluded from git tracking for privacy and security.
 
 ---
 
-# 🛠 Tech Stack
+## ✨ Features
 
-| Category | Technology |
-|----------|------------|
-| Language | Python |
-| Backend | FastAPI |
-| Face Recognition | InsightFace |
-| Similarity Search | FAISS |
-| Computer Vision | OpenCV |
-| Numerical Computing | NumPy |
-| Data Processing | Pandas |
-| GPU Inference | ONNX Runtime |
-| Communication | WebSocket |
-| Server | Uvicorn |
+- 🎯 **Real-Time Multi-Camera Streaming**: Asynchronous RTSP video ingestion with background Watchdog reconnection.
+- 🚀 **InsightFace Deep Learning**: Multi-person face detection (SCRFD) & 512-D embedding extraction (ArcFace / buffalo_m).
+- 🔍 **FAISS Vector Search**: Fast vector similarity matching for registered profiles with customizable confidence thresholds.
+- 🍃 **MongoDB Integration (Async Motor)**: Profile management, multi-vector galleries per identity, and structured event logging.
+- 📸 **Automated Profile Enrollment**: Syncs photo directories (`uploads/<name>/`) to MongoDB and FAISS automatically on startup or via `scripts/enroll_uploads.py`.
+- 👁️ **Face Quality & Blur Filtering**: Filters out blurred or sub-pixel face crops using OpenCV Laplacian variance.
+- ⏱️ **Tracking & Visit Cooldown**: Bounding-box IoU tracking prevents duplicate event triggers during continuous camera presence.
+- 🗑️ **Automatic Retention Cleanup**: TTL index and daily scheduled cleanup for log retention and face crop storage.
+- 📺 **Live Web Dashboard & WebSockets**: Built-in dark-mode web viewer (`/stream`) and high-speed WebSocket stream endpoint (`/face/ws`).
+- ⚡ **Multi-Worker Architecture**: Threaded video capture decoupled from AI inference worker pools to maintain steady FPS.
 
 ---
 
-# 📂 Project Structure
+## 🛠 Tech Stack
+
+| Category | Technology | Description |
+|---|---|---|
+| **Language** | Python 3.9+ | Core programming language |
+| **Backend Framework** | FastAPI | High-performance async API server |
+| **Face Recognition** | InsightFace | SCRFD detection & ArcFace feature extraction |
+| **Vector Search** | FAISS | High-speed L2/IP vector similarity search |
+| **Database** | MongoDB & Motor | Async profile storage & event logging with TTL |
+| **Computer Vision** | OpenCV | Frame processing, blur detection & web streaming |
+| **Server & Real-Time** | Uvicorn & WebSockets | ASGI server and WebSocket communication |
+| **Configuration** | Pydantic Settings | Environment-driven settings management |
+
+---
+
+## 📂 Project Structure
 
 ```text
-Real-Time-Face-Recognition-System/
+real-time-face-recognition-system/
 │
-├── main.py
-├── README.md
-├── requirements.txt
-├── .gitignore
-├── .env.example
-├── LICENSE
-└── docs/
-    └── API.md
+├── core/
+│   ├── quality.py         # Face quality & Laplacian blur filtering
+│   ├── recognition.py     # FAISS vector manager & RecognitionWorker pool
+│   ├── stream_worker.py   # Threaded RTSP capture & Watchdog reconnection
+│   └── tracker.py         # IoU multi-face tracking & visit cooldown manager
+│
+├── database/
+│   ├── mongo.py           # Async MongoDB client, indexes & event logger
+│   └── storage.py         # Face crop storage manager & auto-pruning
+│
+├── scripts/
+│   └── enroll_uploads.py  # Script to enroll photos from uploads/ into MongoDB & FAISS
+│
+├── docs/                  # API and project documentation
+├── uploads/              # Gallery directories containing images for enrollment (e.g. uploads/john_doe/)
+├── crops/                # Saved face crop images from detection events
+│
+├── config.py             # App configuration & environment settings
+├── main.py               # FastAPI server, REST routes, HTML stream UI & WebSockets
+├── faiss_index.bin       # FAISS vector database file
+├── known_ids.pkl         # Mappings for face identity IDs to names
+├── requirements.txt      # Python dependencies
+├── .env.example          # Environment variables template
+└── README.md             # Project documentation
 ```
 
 ---
 
-# ⚙️ Installation
+## ⚙️ Installation & Setup
 
-## Clone Repository
+### 1. Clone Repository & Setup Virtual Environment
 
 ```bash
 git clone https://github.com/Sahil592003/real-time-face-recognition-system.git
-
 cd real-time-face-recognition-system
+
+# Create and activate virtual environment
+python3 -m venv venv
+source venv/bin/activate
 ```
 
----
-
-## Install Dependencies
+### 2. Install Dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
+### 3. Configure Environment Variables
+
+Create `.env` file from `.env.example`:
+
+```bash
+cp .env.example .env
+```
+
+Key configuration parameters in `.env`:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `HOST` | `0.0.0.0` | Server listen host |
+| `PORT` | `8000` | Server listen port |
+| `MONGO_URI` | `mongodb://localhost:27017` | MongoDB connection URI |
+| `MONGO_DB_NAME` | `face_recognition_db` | MongoDB database name |
+| `CROP_DIR` | `./crops` | Path to store detected face crops |
+| `DET_WIDTH` / `DET_HEIGHT` | `640` / `640` | Face detector input resolution |
+| `DET_THRESH` | `0.3` | Minimum face detection threshold |
+| `SAMPLE_FPS` | `6` | Frame sampling rate for AI inference |
+| `MIN_BLUR_VAR` | `100.0` | Minimum Laplacian variance for blur filter |
+| `HIGH_CONF_THRESH` | `0.55` | Confidence threshold for profile matching |
+| `LOW_CONF_THRESH` | `0.40` | Threshold below which auto-enrollment triggers |
+| `VISIT_COOLDOWN_MINS` | `3` | Duplicate alert suppression window (minutes) |
+| `RETENTION_DAYS` | `30` | Data retention period for logs and crop images |
+| `RTSP_STREAMS` | `""` | Comma-separated list of RTSP URLs for auto-start |
+
 ---
 
-## Configure Environment
+## 📸 Face Profile Enrollment
 
-Rename
+To enroll known individuals into the recognition database:
 
-```
-.env.example
-```
+1. Create a subfolder inside `uploads/` named after the person (e.g. `uploads/john_doe/`).
+2. Add clear face photos (`.jpg`, `.png`, `.webp`) into that folder.
+3. Run the enrollment script (or restart the FastAPI server, which auto-syncs `uploads/` on startup):
 
-to
-
-```
-.env
+```bash
+python scripts/enroll_uploads.py
 ```
 
-Update
-
-```
-VIDEOS_FOLDER
-```
-
-with your dataset location.
+This extracts 512-D ArcFace embeddings, updates the MongoDB `face_profiles` collection, and builds the FAISS vector index (`faiss_index.bin`).
 
 ---
 
-## Run
+## 🚀 Running the System
+
+Start the FastAPI server:
 
 ```bash
 python main.py
 ```
 
-Server starts at
+Or using Uvicorn:
 
-```
-http://localhost:8000
-```
-
-Swagger Documentation
-
-```
-http://localhost:8000/docs
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
+- **Server URL**: `http://localhost:8000`
+- **Swagger API Docs**: `http://localhost:8000/docs`
+- **Web Stream Dashboard**: `http://localhost:8000/stream`
 ---
 
-# 📡 API Endpoints
+## 📡 API Endpoints
 
-## Health Check
+### Health Check
 
-```
+```http
 GET /health
 ```
 
-Response
-
+**Response:**
 ```json
 {
-  "status":"ok",
-  "active_recognizers":1
+  "status": "ok",
+  "active_streams": 1,
+  "stream_ids": ["cam_1"],
+  "faiss_registered_vectors": 50,
+  "queue_size": 0,
+  "mongo_connected": true
 }
 ```
 
----
+### Add RTSP Stream Worker
 
-## Reload Face Database
-
-```
-POST /faces/reload
+```http
+POST /streams/add?camera_id=cam1&rtsp_url=rtsp://192.168.1.100:554/stream1
 ```
 
-Response
+### Remove RTSP Stream Worker
 
-```json
-{
-  "status":"success",
-  "num_faces":120,
-  "changed":true,
-  "duration":"2.34s"
-}
+```http
+DELETE /streams/cam1
 ```
 
----
+### Fetch Detection Logs
 
-## Live Recognition
-
-```
-WebSocket
-
-ws://localhost:8000/face/ws?rtsp_url=<RTSP_URL>
+```http
+GET /logs?limit=50&camera_id=cam1
 ```
 
-Returns
+### Web Live Viewer UI
 
-- Live Camera Frames
-- Face Recognition Results
-- Detection Events
+```http
+GET /stream?camera_id=cam_1
+```
+
+### WebSocket Streaming
+
+```websocket
+ws://localhost:8000/face/ws?camera_id=cam_1&rtsp_url=rtsp://192.168.1.100:554/stream1
+```
+
+Streams real-time JPEG frame buffers (`base64`) along with detection metadata and bounding boxes.
 
 ---
 
-# 🔄 Recognition Workflow
+## 🔄 System Architecture & Data Flow
 
-```
-RTSP Camera
-      │
-      ▼
-OpenCV Video Capture
-      │
-      ▼
-InsightFace Detection
-      │
-      ▼
-Face Embedding Extraction
-      │
-      ▼
-FAISS Similarity Search
-      │
-      ▼
-Identity Recognition
-      │
-      ▼
-WebSocket Streaming
-      │
-      ▼
-Frontend Dashboard
+```text
+ RTSP Camera Stream
+        │
+        ▼
+ StreamWorker (Background Thread)
+  - Frame Ingestion
+  - Reconnection Watchdog
+        │
+        ▼
+ Async Job Queue (Queue maxsize=100)
+        │
+        ▼
+ RecognitionWorker Pool
+  - Quality Filter (Laplacian Blur & Box Size)
+  - InsightFace SCRFD Detection & ArcFace Embeddings
+  - FAISS Vector Similarity Search
+  - IoU Bounding Box Tracking & Visit Cooldown
+        │
+        ├──────────────────────────┐
+        ▼                          ▼
+ MongoDB (Motor Driver)    WebSocket Streaming
+  - Face Profiles           - Base64 Frame Buffer
+  - Event Logging           - Dynamic Annotation Overlay
+  - TTL Retention          - HTML Web Viewer (/stream)
 ```
 
 ---
 
-# 🚀 Performance Optimizations
-
-- GPU Accelerated Inference
-- Multi-threaded Processing
-- Automatic RTSP Reconnection
-- FAISS Vector Indexing
-- Embedding Caching
-- Low Latency Recognition
-- Thread-safe Processing
-- Optimized Frame Handling
-
----
-
-# 🔒 Privacy
-
-This repository does **not** include:
-
-- Employee Images
-- Employee Videos
-- Face Embeddings
-- FAISS Index Files
-- Production Datasets
-
-Users can create their own dataset by adding videos/images to the configured dataset directory.
-
----
-
-# 📌 Future Improvements
-
-- Docker Support
-- JWT Authentication
-- Face Registration API
-- Anti-Spoofing
-- Face Mask Detection
-- Multi-Camera Dashboard
-- PostgreSQL Integration
-- Kubernetes Deployment
-- Face Analytics Dashboard
-
----
-
-# 📄 License
+## 📄 License
 
 This project is licensed under the MIT License.
 
 ---
 
-# 👨‍💻 Author
-
-**Sahil Ghadge**
-
-AI/ML Engineer | Computer Vision Engineer | Generative AI Engineer
-
-### Skills
-
-- Computer Vision
-- Deep Learning
-- Face Recognition
-- FastAPI
-- Python
-- OpenCV
-- InsightFace
-- FAISS
-- YOLO
-- Generative AI
-- LangChain
-- Enterprise AI Automation
-
----
-
-⭐ If you found this project useful, consider giving it a **Star** on GitHub.
-
-# 1. Activate the virtual environment
-source venv/bin/activate
-
-# 2. Start the server
-python3 main.py
-
-# 3. Add an RTSP stream (in a separate terminal)
-curl -X POST "http://localhost:8000/streams/add?camera_id=cam1&rtsp_url=rtsp://YOUR_CAMERA_IP:554/stream"
-
-# 4. Check health
-curl http://localhost:8000/health
-
-# 5. View detection logs
-curl http://localhost:8000/logs?limit=20
-
-# 6. Remove a stream
-curl -X DELETE http://localhost:8000/streams/cam1
-
-# 7. WebSocket live stream (auto-registers if stream not active)
-# Connect to: ws://localhost:8000/face/ws?camera_id=cam1&rtsp_url=rtsp://YOUR_CAMERA_IP:554/stream
