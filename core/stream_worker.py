@@ -59,11 +59,16 @@ class StreamWorker:
         self.reconnect_count = 0
         self._first_frame_received = False
         
-        # Start capture thread & watchdog thread
+        # Start capture thread, AI processing thread, and watchdog thread
         self.capture_thread = threading.Thread(
-            target=self._capture_and_process_loop,
+            target=self._capture_loop,
             daemon=True,
-            name=f"Stream_{camera_id}"
+            name=f"Capture_{camera_id}"
+        )
+        self.ai_thread = threading.Thread(
+            target=self._ai_processing_loop,
+            daemon=True,
+            name=f"AI_{camera_id}"
         )
         self.watchdog_thread = threading.Thread(
             target=self._watchdog_loop,
@@ -72,6 +77,7 @@ class StreamWorker:
         )
         
         self.capture_thread.start()
+        self.ai_thread.start()
         self.watchdog_thread.start()
 
     def _connect(self) -> bool:
@@ -86,14 +92,17 @@ class StreamWorker:
                 for transport in transport_modes:
                     os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = (
                         f'rtsp_transport;{transport}'
-                        '|timeout;5000000'      # 5 second timeout in microseconds
-                        '|stimeout;5000000'      # socket timeout in microseconds
-                        '|max_delay;500000'      # max demux delay
+                        '|fflags;nobuffer'       # Disable FFmpeg stream buffering
+                        '|flags;low_delay'       # Enable low-latency decoding
+                        '|framedrop;1'           # Drop stale packets
+                        '|max_delay;0'           # Set max demux delay to 0
+                        '|timeout;5000000'       # 5 sec timeout
+                        '|stimeout;5000000'
                     )
                     self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
                     
                     if self.cap.isOpened():
-                        logger.info(f"[{self.camera_id}] Connected via {transport.upper()} transport")
+                        logger.info(f"[{self.camera_id}] Connected via {transport.upper()} transport (Low Latency Mode)")
                         break
                     
                     logger.debug(f"[{self.camera_id}] {transport.upper()} transport failed, trying next...")
@@ -140,11 +149,8 @@ class StreamWorker:
                     self.cap = None
                 self.last_frame_timestamp = time.time()
 
-    def _capture_and_process_loop(self):
-        """Main loop: 30 FPS buffer decode + 2-Tier AI Sampling at SAMPLE_FPS"""
-        sample_interval = 1.0 / settings.SAMPLE_FPS
-        last_sample_time = 0.0
-        
+    def _capture_loop(self):
+        """Dedicated RTSP frame reading loop: drains FFmpeg buffer as fast as possible"""
         while self.running:
             if self.cap is None or not self.cap.isOpened():
                 logger.info(f"[{self.camera_id}] Reconnecting... attempt {self.reconnect_count + 1}")
@@ -160,7 +166,7 @@ class StreamWorker:
                     ret, frame = False, None
 
             if not ret or frame is None:
-                time.sleep(0.01)
+                time.sleep(0.005)
                 continue
 
             now = time.time()
@@ -169,12 +175,21 @@ class StreamWorker:
             with self.frame_lock:
                 self.last_raw_frame = frame.copy()
 
-            # 2-Tier Sampling: Execute SCRFD + ByteTrack at SAMPLE_FPS (6 FPS)
-            if now - last_sample_time >= sample_interval:
-                last_sample_time = now
-                self._run_ai_pipeline(frame)
+            time.sleep(0.001)
 
-            time.sleep(0.005)
+    def _ai_processing_loop(self):
+        """Dedicated AI loop: processes latest frame at SAMPLE_FPS without blocking RTSP capture"""
+        sample_interval = 1.0 / settings.SAMPLE_FPS
+        
+        while self.running:
+            time.sleep(sample_interval)
+            
+            with self.frame_lock:
+                if self.last_raw_frame is None:
+                    continue
+                frame_to_process = self.last_raw_frame.copy()
+
+            self._run_ai_pipeline(frame_to_process)
 
     def _run_ai_pipeline(self, frame: np.ndarray):
         """Runs SCRFD detection, ByteTrack tracking, and enqueues qualified face crops"""
