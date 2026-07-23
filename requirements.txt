@@ -7,3 +7,10 @@ insightface
 faiss-cpu
 onnxruntime
 python-multipart
+supervision
+motor
+pymongo
+pydantic
+pydantic-settings
+python-dotenv
+websockets

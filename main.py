@@ -1,28 +1,92 @@
-
-
-import os
-import cv2
 import asyncio
-import base64
-import numpy as np
-import threading
+import logging
 import time
-import pandas as pd
-import pickle
-import random
-from queue import Queue, Empty
-from datetime import datetime, timedelta
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, APIRouter
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from insightface.app import FaceAnalysis
-import faiss
+from typing import Dict, Optional, List
+from contextlib import asynccontextmanager
 
-# ======================
-# FASTAPI SETUP
-# ======================
-app = FastAPI()
-router = APIRouter()
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, HTTPException, APIRouter
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from config import settings
+from database.mongo import mongo_db
+from database.storage import crop_storage
+from core.stream_worker import StreamWorker, get_face_detector
+from core.recognition import faiss_manager, RecognitionWorker
+
+# Configure Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("main_service")
+
+# Global Stream & Worker Registry
+active_streams: Dict[str, StreamWorker] = {}
+recognition_job_queue: Optional[asyncio.Queue] = None
+recognition_worker: Optional[RecognitionWorker] = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global recognition_job_queue, recognition_worker
+    logger.info("Initializing Real-Time Face Recognition Service...")
+    
+    # 1. Connect MongoDB
+    await mongo_db.connect()
+    
+    # 2. Initialize FAISS Vector Index
+    faiss_manager.initialize()
+    if not faiss_manager.load_from_disk():
+        # Load seed profiles from MongoDB if disk index absent
+        db_profiles = await mongo_db.load_all_profiles()
+        for p in db_profiles:
+            pid = p["profile_id"]
+            for vec in p.get("embeddings", []):
+                import numpy as np
+                faiss_manager.add_vector(np.array(vec, dtype=np.float32), pid)
+        logger.info(f"Seeded FAISS index with {len(faiss_manager.faiss_ids)} vectors from MongoDB.")
+        
+    # 3. Create Async Job Queue & Start Recognition Workers
+    recognition_job_queue = asyncio.Queue(maxsize=100)
+    detector = get_face_detector()
+    recognition_worker = RecognitionWorker(recognition_job_queue, detector)
+    await recognition_worker.start_worker_pool(num_workers=2)
+    
+    # 4. Schedule daily retention cleanup task
+    asyncio.create_task(periodic_retention_cleanup())
+
+    # 5. Auto-start RTSP streams from .env config
+    if settings.RTSP_STREAMS.strip():
+        loop = asyncio.get_event_loop()
+        for idx, rtsp_url in enumerate(settings.RTSP_STREAMS.split(","), start=1):
+            rtsp_url = rtsp_url.strip()
+            if not rtsp_url:
+                continue
+            camera_id = f"cam_{idx}"
+            worker = StreamWorker(camera_id, rtsp_url, recognition_job_queue, loop)
+            active_streams[camera_id] = worker
+            logger.info(f"Auto-started stream: {camera_id} -> {rtsp_url}")
+            logger.info(f"  WebSocket URL: ws://{settings.HOST}:{settings.PORT}/face/ws?camera_id={camera_id}")
+
+    logger.info("Service initialized successfully.")
+    logger.info(f"API docs: http://{settings.HOST}:{settings.PORT}/docs")
+    for cam_id in active_streams:
+        logger.info(f"Stream '{cam_id}' WebSocket: ws://{settings.HOST}:{settings.PORT}/face/ws?camera_id={cam_id}")
+    yield
+
+    # Shutdown logic
+    logger.info("Shutting down service...")
+    if recognition_worker is not None:
+        recognition_worker.running = False
+        
+    for cam_id, worker in list(active_streams.items()):
+        worker.stop()
+        
+    await mongo_db.close()
+    logger.info("Shutdown complete.")
+
+app = FastAPI(title="Real-Time Face Recognition Service", lifespan=lifespan)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,559 +95,261 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ======================
-# OPTIMIZED INSIGHTFACE MODEL
-# ======================
-face_app = FaceAnalysis(
-    name='buffalo_m',
-    providers=['CUDAExecutionProvider'],
-    allowed_modules=['detection', 'recognition']
-)
-face_app.prepare(
-    ctx_id=0,
-    det_size=(320, 320),
-    det_thresh=0.3
-)
-print("InsightFace loaded on GPU")
+# Serve crop images static files
+import os
+os.makedirs(settings.CROP_DIR, exist_ok=True)
+app.mount("/crops", StaticFiles(directory=settings.CROP_DIR), name="crops")
 
-# ======================
-# LOAD KNOWN FACES
-# ======================
-VIDEOS_FOLDER = os.getenv("VIDEOS_FOLDER", "./Employee")
-known_face_embeddings = {}
-index = None
-known_ids = []
-FAISS_INDEX_PATH = "faiss_index.bin"
-KNOWN_IDS_PATH = "known_ids.pkl"
-EMBEDDINGS_PATH = "known_embeddings.pkl"
-index_lock = threading.Lock()
+router = APIRouter()
 
-def load_known_faces():
-    global known_face_embeddings
-    changed = False
-    if os.path.exists(VIDEOS_FOLDER):
-        if os.path.exists(EMBEDDINGS_PATH):
-            with open(EMBEDDINGS_PATH, 'rb') as f:
-                stored_data = pickle.load(f)
-        else:
-            stored_data = {}
-       
-        temp_embeddings = {}
-        for person_folder in sorted(os.listdir(VIDEOS_FOLDER)):
-            person_path = os.path.join(VIDEOS_FOLDER, person_folder)
-            if not os.path.isdir(person_path):
-                continue
-            person_key = person_folder
-            current_videos = sorted([f for f in os.listdir(person_path) if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv'))])
-           
-            if person_key in stored_data:
-                processed_videos = stored_data[person_key]['processed_videos']
-                new_videos = [v for v in current_videos if v not in processed_videos]
-                if new_videos:
-                    new_embeddings = []
-                    for file in new_videos:
-                        vid_path = os.path.join(person_path, file)
-                        cap = cv2.VideoCapture(vid_path)
-                        frame_count = 0
-                        while cap.isOpened():
-                            ret, frame = cap.read()
-                            if not ret:
-                                break
-                            if frame_count % 15 == 0:
-                                faces = face_app.get(frame, max_num=1)
-                                if faces and len(faces) > 0:
-                                    new_embeddings.append(faces[0].embedding)
-                            frame_count += 1
-                        cap.release()
-                    if new_embeddings:
-                        changed = True
-                        old_avg = stored_data[person_key]['avg']
-                        old_count = stored_data[person_key]['count']
-                        new_sum = np.sum(new_embeddings, axis=0)
-                        updated_avg = (old_avg * old_count + new_sum) / (old_count + len(new_embeddings))
-                        stored_data[person_key]['avg'] = updated_avg
-                        stored_data[person_key]['count'] += len(new_embeddings)
-                        print(f"Updated {person_folder} with {len(new_embeddings)} new samples")
-                    stored_data[person_key]['processed_videos'] = current_videos[:]
-                else:
-                    print(f"{person_folder} up to date")
-                temp_embeddings[person_key] = stored_data[person_key]['avg']
-            else:
-                embeddings = []
-                for file in current_videos:
-                    vid_path = os.path.join(person_path, file)
-                    cap = cv2.VideoCapture(vid_path)
-                    frame_count = 0
-                    while cap.isOpened():
-                        ret, frame = cap.read()
-                        if not ret:
-                            break
-                        if frame_count % 15 == 0:
-                            faces = face_app.get(frame, max_num=1)
-                            if faces and len(faces) > 0:
-                                embeddings.append(faces[0].embedding)
-                        frame_count += 1
-                    cap.release()
-                if len(embeddings) >= 3:
-                    changed = True
-                    avg = np.mean(embeddings, axis=0)
-                    stored_data[person_key] = {
-                        'avg': avg,
-                        'count': len(embeddings),
-                        'processed_videos': current_videos[:]
-                    }
-                    temp_embeddings[person_key] = avg
-                    print(f"Loaded new {person_folder} ({len(embeddings)} samples)")
-                else:
-                    print(f"Skipped {person_folder} (<3 samples)")
-       
-        with open(EMBEDDINGS_PATH, 'wb') as f:
-            pickle.dump(stored_data, f)
-       
-        known_face_embeddings = temp_embeddings
-    print(f"Total known identities: {len(known_face_embeddings)}")
-    return changed
-
-def build_index():
-    known_ids_local = list(known_face_embeddings.keys())
-    if not known_ids_local:
-        return None, []
-    db_embeddings = np.stack(list(known_face_embeddings.values()))
-    norms = np.linalg.norm(db_embeddings, axis=1, keepdims=True)
-    db_embeddings /= norms
-    dimension = db_embeddings.shape[1]
-    new_index = faiss.IndexFlatIP(dimension)
-    new_index.add(db_embeddings)
-    print(f"Built new FAISS index with {len(known_ids_local)} known faces")
-    return new_index, known_ids_local
-
-def load_or_build_index():
-    global index, known_ids
-    changed = load_known_faces()
-    if not changed and os.path.exists(FAISS_INDEX_PATH) and os.path.exists(KNOWN_IDS_PATH):
+async def periodic_retention_cleanup():
+    while True:
         try:
-            temp_index = faiss.read_index(FAISS_INDEX_PATH)
-            with open(KNOWN_IDS_PATH, 'rb') as f:
-                temp_ids = pickle.load(f)
-            with index_lock:
-                index = temp_index
-                known_ids = temp_ids
-            print(f"Loaded existing FAISS index with {len(known_ids)} known faces")
-            return
+            crop_storage.prune_old_crops(settings.RETENTION_DAYS)
         except Exception as e:
-            print(f"Error loading FAISS: {e}, rebuilding...")
-    
-    new_index, new_ids = build_index()
-    if new_index is not None:
-        with index_lock:
-            index = new_index
-            known_ids = new_ids
-        faiss.write_index(index, FAISS_INDEX_PATH)
-        with open(KNOWN_IDS_PATH, 'wb') as f:
-            pickle.dump(known_ids, f)
-        print(f"Built and saved FAISS index with {len(known_ids)} known faces")
-    else:
-        with index_lock:
-            index = None
-            known_ids = []
+            logger.error(f"Error in retention cleanup: {e}")
+        await asyncio.sleep(86400)  # Run once every 24 hours
 
-load_or_build_index()
+from fastapi.responses import HTMLResponse
 
 # ======================
-# RELOAD ENDPOINT
+# REST API & STREAM ENDPOINTS
 # ======================
-@app.post("/faces/reload")
-async def reload_faces():
-    print("Manual reload triggered...")
-    start_time = time.time()
-    changed = load_known_faces()
-    new_index, new_ids = build_index()
-    if new_index is None:
-        return {"status": "error", "message": "No known faces to index"}
-    with index_lock:
-        global index, known_ids
-        index = new_index
-        known_ids = new_ids
-    faiss.write_index(index, FAISS_INDEX_PATH)
-    with open(KNOWN_IDS_PATH, 'wb') as f:
-        pickle.dump(known_ids, f)
-    duration = time.time() - start_time
-    print(f"Reload complete: {len(known_ids)} faces, {duration:.2f}s")
+
+@router.get("/stream", response_class=HTMLResponse)
+async def get_stream_page(camera_id: str = "cam_1"):
+    html_content = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Real-Time Face Recognition Stream - {camera_id}</title>
+        <style>
+            body {{
+                margin: 0;
+                padding: 20px;
+                background-color: #0f172a;
+                color: #f8fafc;
+                font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                min-height: 100vh;
+            }}
+            h1 {{
+                margin-bottom: 5px;
+                font-size: 1.8rem;
+                font-weight: 600;
+                color: #38bdf8;
+            }}
+            .subtitle {{
+                color: #94a3b8;
+                font-size: 0.95rem;
+                margin-bottom: 20px;
+            }}
+            .video-container {{
+                position: relative;
+                max-width: 960px;
+                width: 100%;
+                background: #1e293b;
+                border-radius: 12px;
+                box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.5);
+                overflow: hidden;
+                border: 1px solid #334155;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                min-height: 480px;
+            }}
+            img {{
+                width: 100%;
+                height: auto;
+                display: block;
+            }}
+            .status-badge {{
+                position: absolute;
+                top: 15px;
+                left: 15px;
+                background: rgba(15, 23, 42, 0.8);
+                backdrop-filter: blur(8px);
+                padding: 6px 14px;
+                border-radius: 20px;
+                font-size: 0.85rem;
+                font-weight: 500;
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                border: 1px solid rgba(255, 255, 255, 0.1);
+            }}
+            .dot {{
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                background-color: #ef4444;
+            }}
+            .dot.connected {{
+                background-color: #10b981;
+                box-shadow: 0 0 8px #10b981;
+            }}
+        </style>
+    </head>
+    <body>
+        <h1>🎯 Real-Time Face Recognition</h1>
+        <div class="subtitle">Camera ID: <strong>{camera_id}</strong></div>
+        
+        <div class="video-container">
+            <div class="status-badge">
+                <div class="dot" id="statusDot"></div>
+                <span id="statusText">Connecting...</span>
+            </div>
+            <img id="streamFrame" src="" alt="Stream Feed" />
+        </div>
+
+        <script>
+            const camera_id = "{camera_id}";
+            const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+            const wsUrl = `${{wsProtocol}}//${{window.location.host}}/face/ws?camera_id=${{camera_id}}`;
+            
+            const imgEl = document.getElementById("streamFrame");
+            const statusDot = document.getElementById("statusDot");
+            const statusText = document.getElementById("statusText");
+
+            function connect() {{
+                const ws = new WebSocket(wsUrl);
+                
+                ws.onopen = () => {{
+                    statusDot.classList.add("connected");
+                    statusText.textContent = "LIVE";
+                }};
+
+                ws.onmessage = (event) => {{
+                    try {{
+                        const data = JSON.parse(event.data);
+                        if (data.type === "frame" && data.frame) {{
+                            imgEl.src = "data:image/jpeg;base64," + data.frame;
+                        }}
+                    }} catch (e) {{
+                        console.error("Error parsing message", e);
+                    }}
+                }};
+
+                ws.onclose = () => {{
+                    statusDot.classList.remove("connected");
+                    statusText.textContent = "Disconnected - Retrying...";
+                    setTimeout(connect, 2000);
+                }};
+
+                ws.onerror = (err) => {{
+                    console.error("WebSocket error:", err);
+                    ws.close();
+                }};
+            }}
+
+            connect();
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+@router.get("/health")
+async def health_check():
     return {
-        "status": "success",
-        "num_faces": len(known_ids),
-        "changed": changed,
-        "duration": f"{duration:.2f}s"
+        "status": "ok",
+        "active_streams": len(active_streams),
+        "stream_ids": list(active_streams.keys()),
+        "faiss_registered_vectors": len(faiss_manager.faiss_ids) if faiss_manager.index else 0,
+        "queue_size": recognition_job_queue.qsize() if recognition_job_queue else 0,
+        "mongo_connected": mongo_db.db is not None
     }
 
-# ======================
-# FIXED RTSP CLASS (SINGLE __init__)
-# ======================
-class RTSPFaceRecognition:
-    def __init__(self, rtsp_url):
-        self.rtsp_url = rtsp_url
-        self.frame_queue = Queue(maxsize=3)
-        self.running = True
-        self.cap = None
-        self.last_frame = None
-        self.last_processed_frame = None
-        # Changed: Replaced detected_today and today with cooldown mechanism
-        self.detection_cooldown = timedelta(minutes=1)  # 1 minute cooldown
-        self.last_detection_time = {}  # Track last detection timestamp per person
-        self.pending_messages = []
-        self.lock = threading.Lock()
-        self.cap_lock = threading.Lock()
-        self.reconnect_count = 0
-        self.max_reconnects = None
-        self.processing = False
-        self.last_process_time = 0
-        self.target_fps = 5
-        self.frame_skip_counter = 0
-        self.process_every_n_frames = 2
-        self.last_annotations = []
-        self.last_known_detected = False
-        self.initial_frames_sent = False
-        self._first_frame_received = False  # Track if we've received first frame
-        
-        # Start threads
-        threading.Thread(target=self._capture_loop, daemon=True, name=f"CaptureThread_{id(self)}").start()
-        threading.Thread(target=self._process_loop, daemon=True, name=f"ProcessThread_{id(self)}").start()
-        
-    def _connect(self):
-        with self.cap_lock:
-            try:
-                if self.cap is not None:
-                    self.cap.release()
-                time.sleep(0.5)
-                
-                os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
-                self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
-                
-                if not self.cap.isOpened():
-                    print(f"Failed to open RTSP stream: {self.rtsp_url}")
-                    return False
-                
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                self.cap.set(cv2.CAP_PROP_FPS, 15)
-                
-                ret, test_frame = self.cap.read()
-                if not ret or test_frame is None:
-                    self.cap.release()
-                    return False
-                
-                with self.lock:
-                    self.last_frame = test_frame.copy()
-                    self.last_processed_frame = test_frame.copy()
-                    self._first_frame_received = True
-                
-                print(f"✓ RTSP connected: {self.rtsp_url}")
-                self.reconnect_count = 0
-                return True
-                
-            except Exception as e:
-                print(f"Connection error: {e}")
-                if self.cap:
-                    self.cap.release()
-                self.cap = None
-                return False
+@router.post("/streams/add")
+async def add_stream(camera_id: str = Query(...), rtsp_url: str = Query(...)):
+    if camera_id in active_streams:
+        raise HTTPException(status_code=400, detail=f"Stream '{camera_id}' is already active.")
     
-    def _capture_loop(self):
-        consecutive_failures = 0
-        max_consecutive_failures = 10
-        
-        while self.running:
-            try:
-                if self.cap is None or not self.cap.isOpened():
-                    if self.max_reconnects is not None and self.reconnect_count >= self.max_reconnects:
-                        print("Max reconnection attempts reached. Stopping.")
-                        self.running = False
-                        break
-                    
-                    print(f"Reconnecting... (attempt {self.reconnect_count + 1})")
-                    if not self._connect():
-                        self.reconnect_count += 1
-                        sleep_time = min(2 ** min(self.reconnect_count, 10), 60) + random.uniform(0, 1)
-                        print(f"Reconnect failed, waiting {sleep_time:.1f}s")
-                        time.sleep(sleep_time)
-                        continue
-                
-                with self.cap_lock:
-                    if self.cap and self.cap.isOpened():
-                        ret, frame = self.cap.read()
-                    else:
-                        ret, frame = False, None
-                
-                if ret and frame is not None:
-                    consecutive_failures = 0
-                    
-                    # Always keep the latest frame
-                    with self.lock:
-                        self.last_frame = frame.copy()
-                        if not self._first_frame_received:
-                            self._first_frame_received = True
-                    
-                    # Put in queue for processing
-                    if not self.frame_queue.full():
-                        try:
-                            self.frame_queue.put_nowait(frame)
-                        except:
-                            pass
-                else:
-                    consecutive_failures += 1
-                    if consecutive_failures >= max_consecutive_failures:
-                        print("Too many consecutive failures, reconnecting...")
-                        with self.cap_lock:
-                            if self.cap:
-                                self.cap.release()
-                            self.cap = None
-                        consecutive_failures = 0
-                        time.sleep(1)
-                
-                time.sleep(0.001)
-                
-            except Exception as e:
-                print(f"Error in capture loop: {e}")
-                consecutive_failures += 1
-                time.sleep(1)
+    if recognition_job_queue is None:
+        raise HTTPException(status_code=503, detail="Service not initialized yet.")
     
-    def _process_loop(self):
-        while self.running:
-            try:
-                now = time.time()
-                
-                if now - self.last_process_time < 1.0 / self.target_fps:
-                    time.sleep(0.005)
-                    continue
-                
-                if self.processing:
-                    time.sleep(0.005)
-                    continue
-                
-                try:
-                    frame = self.frame_queue.get_nowait()
-                except Empty:
-                    time.sleep(0.01)
-                    continue
-                
-                # Removed: date-based reset logic
-                # Now using cooldown mechanism instead
-                
-                self.processing = True
-                try:
-                    processed_frame = self._recognize_and_draw(frame)
-                    with self.lock:
-                        self.last_processed_frame = processed_frame
-                finally:
-                    self.processing = False
-                
-                self.last_process_time = now
-                
-            except Exception as e:
-                print(f"Error in process loop: {e}")
-                self.processing = False
-                time.sleep(0.1)
+    loop = asyncio.get_event_loop()
+    worker = StreamWorker(camera_id, rtsp_url, recognition_job_queue, loop)
+    active_streams[camera_id] = worker
+    logger.info(f"Added and started stream worker for camera: {camera_id}")
     
-    def _recognize_and_draw(self, frame):
-        try:
-            processed_frame = frame.copy()
-            faces = face_app.get(processed_frame, max_num=3)
-            
-            annotations = []
-            known_detected = False
-            
-            for face in faces:
-                if face.det_score < 0.3:
-                    continue
-                
-                bbox = face.bbox.astype(int)
-                face_width = bbox[2] - bbox[0]
-                
-                if face_width < 60:
-                    continue
-                
-                emb = face.embedding
-                qnorm = emb / np.linalg.norm(emb)
-                
-                best_id = "Unknown"
-                best_sim = 0.0
-                
-                if index is not None and len(known_ids) > 0:
-                    with index_lock:
-                        local_index = index
-                        local_known_ids = known_ids
-                        if local_index is not None and len(local_known_ids) > 0:
-                            distances, indices = local_index.search(qnorm.reshape(1, -1), k=1)
-                            best_sim = distances[0][0]
-                            if len(indices[0]) > 0:
-                                best_idx = indices[0][0]
-                                best_id = local_known_ids[best_idx]
-                
-                if best_sim >= 0.50:
-                    color = (0, 255, 0)
-                    label = f"{best_id} ({best_sim:.2f})"
-                else:
-                    color = (0, 0, 255)
-                    label = f"Unknown ({best_sim:.2f})"
-                
-                cv2.rectangle(processed_frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
-                cv2.putText(processed_frame, label, (bbox[0], bbox[1]-10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                
-                annotations.append({
-                    'bbox': list(bbox),
-                    'color': color,
-                    'label': label
-                })
-                
-                # Changed: 1-minute cooldown logic instead of daily reset
-                if best_sim >= 0.50:
-                    known_detected = True
-                    current_time = datetime.now()
-                    
-                    # Check if cooldown period has passed since last detection
-                    if best_id not in self.last_detection_time or \
-                       (current_time - self.last_detection_time[best_id]) > self.detection_cooldown:
-                        
-                        self.last_detection_time[best_id] = current_time
-                        self._log_detection(best_id)
-            
-            if known_detected:
-                cv2.putText(processed_frame, "KNOWN PERSON DETECTED!", (10, 40),
-                           cv2.FONT_HERSHEY_DUPLEX, 1.0, (0, 0, 255), 3)
-            
-            self.last_annotations = annotations
-            self.last_known_detected = known_detected
-            
-            return processed_frame
-            
-        except Exception as e:
-            print(f"Error in recognition: {e}")
-            return frame
+    return {
+        "status": "success",
+        "camera_id": camera_id,
+        "message": f"Stream worker started for {rtsp_url}"
+    }
+
+@router.delete("/streams/{camera_id}")
+async def remove_stream(camera_id: str):
+    if camera_id not in active_streams:
+        raise HTTPException(status_code=404, detail=f"Stream '{camera_id}' not found.")
     
-    def _log_detection(self, emp_id):
-        message = {"type": "detection", "emp_id": emp_id}
-        with self.lock:
-            self.pending_messages.append(message)
-        print(f"[LOGGED] {emp_id}")
+    worker = active_streams.pop(camera_id)
+    worker.stop()
+    logger.info(f"Stopped stream worker for camera: {camera_id}")
     
-    async def get_frame_base64(self):
-        """Get frame as base64 - ensures we return something even if processing isn't done"""
-        # Wait a bit for first frame if needed
-        wait_attempts = 0
-        while not self._first_frame_received and wait_attempts < 20:
-            await asyncio.sleep(0.1)
-            wait_attempts += 1
-        
-        with self.lock:
-            # Try to get processed frame first, fall back to raw frame
-            frame_to_send = self.last_processed_frame if self.last_processed_frame is not None else self.last_frame
-            if frame_to_send is None:
-                return None
-            frame = frame_to_send.copy()
-        
-        try:
-            _, buffer = cv2.imencode(
-                '.jpg',
-                frame,
-                [cv2.IMWRITE_JPEG_QUALITY, 40, cv2.IMWRITE_JPEG_OPTIMIZE, 1]
-            )
-            return base64.b64encode(buffer).decode()
-        except Exception as e:
-            print(f"Error encoding frame: {e}")
-            return None
-    
-    def stop(self):
-        """Clean shutdown"""
-        print("Stopping recognizer...")
-        self.running = False
-        time.sleep(0.5)
-        with self.cap_lock:
-            if self.cap:
-                self.cap.release()
-            self.cap = None
+    return {
+        "status": "success",
+        "camera_id": camera_id,
+        "message": "Stream worker stopped"
+    }
+
+@router.get("/logs")
+async def get_logs(limit: int = 50, camera_id: Optional[str] = None):
+    events = await mongo_db.get_recent_events(limit=limit, camera_id=camera_id)
+    return {"status": "success", "count": len(events), "events": events}
 
 # ======================
-# WEBSOCKET ENDPOINT (FIXED)
+# WEBSOCKET STREAMING
 # ======================
-# Store active recognizers for cleanup
-active_recognizers = {}
-recognizers_lock = threading.Lock()
 
 @router.websocket("/face/ws")
-async def face_websocket(websocket: WebSocket, rtsp_url: str = Query(...)):
+async def face_websocket(websocket: WebSocket, camera_id: str = Query(...), rtsp_url: Optional[str] = Query(None)):
     await websocket.accept()
     
-    # Create unique ID for this connection
-    connection_id = f"{rtsp_url}_{id(websocket)}"
-    
-    # Check if we already have a recognizer for this RTSP URL
-    if rtsp_url in active_recognizers:
-        recognizer = active_recognizers[rtsp_url]
-        print(f"Reusing existing recognizer for {rtsp_url}")
+    # Auto-register stream if missing and rtsp_url provided
+    if camera_id not in active_streams:
+        if not rtsp_url:
+            await websocket.send_json({"type": "error", "message": f"Camera '{camera_id}' not active and no rtsp_url provided."})
+            await websocket.close()
+            return
+        
+        if recognition_job_queue is None:
+            await websocket.send_json({"type": "error", "message": "Service not initialized yet."})
+            await websocket.close()
+            return
+        
+        loop = asyncio.get_event_loop()
+        worker = StreamWorker(camera_id, rtsp_url, recognition_job_queue, loop)
+        active_streams[camera_id] = worker
+        logger.info(f"Auto-registered stream via WebSocket for: {camera_id}")
     else:
-        recognizer = RTSPFaceRecognition(rtsp_url)
-        active_recognizers[rtsp_url] = recognizer
-        print(f"Created new recognizer for {rtsp_url}")
-    
+        worker = active_streams[camera_id]
+
     try:
-        # Send initial frames quickly to establish stream
         frame_count = 0
         while True:
-            frame_b64 = await recognizer.get_frame_base64()
-            
+            frame_b64 = worker.get_latest_frame_b64()
             if frame_b64:
-                # Send frame
-                await websocket.send_json({"frame": frame_b64, "type": "frame"})
+                await websocket.send_json({
+                    "type": "frame",
+                    "camera_id": camera_id,
+                    "frame": frame_b64
+                })
                 frame_count += 1
                 
-                # Log occasionally
-                if frame_count % 30 == 0:
-                    print(f"Sent {frame_count} frames for {rtsp_url}")
-            
-            # Send pending detection messages
-            with recognizer.lock:
-                messages = recognizer.pending_messages.copy()
-                recognizer.pending_messages.clear()
-            
-            for msg in messages:
-                print(f"[WS SENDING TO CLIENT] {msg} for {rtsp_url}")
-                await websocket.send_json(msg)
-            
-            # Throttle to reasonable FPS
-            await asyncio.sleep(0.066)  # ~15 FPS
-            
+            await asyncio.sleep(0.066)  # ~15 FPS WebSocket stream rate
     except WebSocketDisconnect:
-        print(f"WebSocket disconnected for {rtsp_url}")
-        # Don't stop the recognizer immediately - keep it for potential reconnection
-        # This prevents the need to restart the stream
-        
-        # Optional: Implement timeout cleanup
-        # For now, we keep the recognizer alive
-        
+        logger.info(f"WebSocket disconnected for camera: {camera_id}")
     except Exception as e:
-        print(f"WS Error: {e}")
-        import traceback
-        traceback.print_exc()
-
-# Optional: Cleanup old recognizers (you can call this periodically)
-async def cleanup_old_recognizers():
-    """Clean up recognizers that haven't been used recently"""
-    # This is optional - implement if needed
-    pass
+        logger.error(f"WebSocket error on camera {camera_id}: {e}")
 
 app.include_router(router)
 
-# ======================
-# HEALTH CHECK ENDPOINT
-# ======================
-@app.get("/health")
-async def health_check():
-    return {"status": "ok", "active_recognizers": len(active_recognizers)}
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000, workers=1)
-
-
-
-
+    uvicorn.run(app, host=settings.HOST, port=settings.PORT, workers=1)

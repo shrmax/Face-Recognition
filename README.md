@@ -291,3 +291,24 @@ AI/ML Engineer | Computer Vision Engineer | Generative AI Engineer
 ---
 
 ⭐ If you found this project useful, consider giving it a **Star** on GitHub.
+
+# 1. Activate the virtual environment
+source venv/bin/activate
+
+# 2. Start the server
+python3 main.py
+
+# 3. Add an RTSP stream (in a separate terminal)
+curl -X POST "http://localhost:8000/streams/add?camera_id=cam1&rtsp_url=rtsp://YOUR_CAMERA_IP:554/stream"
+
+# 4. Check health
+curl http://localhost:8000/health
+
+# 5. View detection logs
+curl http://localhost:8000/logs?limit=20
+
+# 6. Remove a stream
+curl -X DELETE http://localhost:8000/streams/cam1
+
+# 7. WebSocket live stream (auto-registers if stream not active)
+# Connect to: ws://localhost:8000/face/ws?camera_id=cam1&rtsp_url=rtsp://YOUR_CAMERA_IP:554/stream
