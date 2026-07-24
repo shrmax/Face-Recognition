@@ -46,10 +46,12 @@ async def lifespan(app: FastAPI):
     faiss_manager.initialize()
     db_profiles = await mongo_db.load_all_profiles()
     for p in db_profiles:
-        pid = p["profile_id"]
-        name = p.get("name", pid)
-        for vec in p.get("embeddings", []):
-            faiss_manager.add_vector(np.array(vec, dtype=np.float32), pid, name)
+        pid = str(p.get("profile_id", ""))
+        name = str(p.get("name", pid))
+        embeddings = p.get("embeddings")
+        if isinstance(embeddings, list):
+            for vec in embeddings:
+                faiss_manager.add_vector(np.array(vec, dtype=np.float32), pid, name)
     faiss_manager.save_to_disk()
     logger.info(f"Successfully loaded FAISS index with {len(faiss_manager.faiss_ids)} vectors from MongoDB ({len(db_profiles)} profiles).")
         
