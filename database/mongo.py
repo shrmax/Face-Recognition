@@ -1,10 +1,24 @@
 import logging
-from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Optional
+import numpy as np
+from datetime import datetime, timezone
+from typing import List, Dict, Optional, Mapping
 from motor.motor_asyncio import AsyncIOMotorClient
 from config import settings
 
 logger = logging.getLogger("mongo_db")
+
+def _sanitize_bson(obj: object) -> object:
+    if isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+        return obj.item()
+    elif isinstance(obj, (np.floating, np.float64, np.float32)):
+        return obj.item()
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {str(k): _sanitize_bson(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [_sanitize_bson(x) for x in obj]
+    return obj
 
 class MongoDBManager:
     def __init__(self):
@@ -48,17 +62,20 @@ class MongoDBManager:
             self.client.close()
             logger.info("MongoDB connection closed.")
 
-    async def save_detection_event(self, event_data: Dict[str, Any]) -> bool:
+    async def save_detection_event(self, event_data: Mapping[str, object]) -> bool:
         if self.db is None:
             return False
         try:
-            await self.db["detection_events"].insert_one(event_data)
-            return True
+            clean_data = _sanitize_bson(event_data)
+            if isinstance(clean_data, dict):
+                await self.db["detection_events"].insert_one(clean_data)
+                return True
+            return False
         except Exception as e:
             logger.error(f"Failed to insert detection event: {e}")
             return False
 
-    async def get_recent_events(self, limit: int = 50, camera_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    async def get_recent_events(self, limit: int = 50, camera_id: Optional[str] = None) -> List[Dict[str, object]]:
         if self.db is None:
             return []
         try:
@@ -118,7 +135,7 @@ class MongoDBManager:
             logger.error(f"Failed to save profile {profile_id}: {e}")
             return False
 
-    async def load_all_profiles(self) -> List[Dict[str, Any]]:
+    async def load_all_profiles(self) -> List[Dict[str, object]]:
         if self.db is None:
             return []
         try:

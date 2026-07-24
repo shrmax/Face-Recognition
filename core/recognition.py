@@ -154,14 +154,14 @@ class RecognitionWorker:
 
             if not in_cooldown:
                 event_doc = {
-                    "camera_id": camera_id,
-                    "track_id": track_id,
-                    "profile_id": best_profile_id,
-                    "confidence": sim,
+                    "camera_id": str(camera_id),
+                    "track_id": int(track_id),
+                    "profile_id": str(best_profile_id),
+                    "confidence": float(sim),
                     "event_type": "KNOWN_IDENTITY",
                     "timestamp": now,
-                    "bbox": list(bbox),
-                    "crop_path": crop_file_path,
+                    "bbox": [int(x) for x in bbox],
+                    "crop_path": str(crop_file_path),
                     "review_required": False
                 }
                 await mongo_db.save_detection_event(event_doc)
@@ -177,14 +177,14 @@ class RecognitionWorker:
             stream_worker.track_manager.set_track_identity(track_id, "Review_Required", label, is_new_visit=True)
 
             event_doc = {
-                "camera_id": camera_id,
-                "track_id": track_id,
-                "profile_id": best_profile_id,
-                "confidence": sim,
+                "camera_id": str(camera_id),
+                "track_id": int(track_id),
+                "profile_id": str(best_profile_id),
+                "confidence": float(sim),
                 "event_type": "UNCERTAIN_CANDIDATE",
                 "timestamp": now,
-                "bbox": list(bbox),
-                "crop_path": crop_file_path,
+                "bbox": [int(x) for x in bbox],
+                "crop_path": str(crop_file_path),
                 "review_required": True
             }
             await mongo_db.save_detection_event(event_doc)
@@ -219,14 +219,14 @@ class RecognitionWorker:
             new_crop_path = crop_storage.save_crop(crop, new_profile_id, track_id)
 
             event_doc = {
-                "camera_id": camera_id,
-                "track_id": track_id,
-                "profile_id": new_profile_id,
-                "confidence": sim,
+                "camera_id": str(camera_id),
+                "track_id": int(track_id),
+                "profile_id": str(new_profile_id),
+                "confidence": float(sim),
                 "event_type": "NEW_IDENTITY",
                 "timestamp": now,
-                "bbox": list(bbox),
-                "crop_path": new_crop_path,
+                "bbox": [int(x) for x in bbox],
+                "crop_path": str(new_crop_path),
                 "review_required": False
             }
             await mongo_db.save_detection_event(event_doc)

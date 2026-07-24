@@ -39,16 +39,16 @@ The system includes automatic dataset enrollment, multi-vector gallery profiling
 
 ## 🛠 Tech Stack
 
-| Category | Technology | Description |
-|---|---|---|
-| **Language** | Python 3.9+ | Core programming language |
-| **Backend Framework** | FastAPI | High-performance async API server |
-| **Face Recognition** | InsightFace | SCRFD detection & ArcFace feature extraction |
-| **Vector Search** | FAISS | High-speed L2/IP vector similarity search |
-| **Database** | MongoDB & Motor | Async profile storage & event logging with TTL |
-| **Computer Vision** | OpenCV | Frame processing, blur detection & web streaming |
-| **Server & Real-Time** | Uvicorn & WebSockets | ASGI server and WebSocket communication |
-| **Configuration** | Pydantic Settings | Environment-driven settings management |
+| Category               | Technology           | Description                                      |
+| ---------------------- | -------------------- | ------------------------------------------------ |
+| **Language**           | Python 3.9+          | Core programming language                        |
+| **Backend Framework**  | FastAPI              | High-performance async API server                |
+| **Face Recognition**   | InsightFace          | SCRFD detection & ArcFace feature extraction     |
+| **Vector Search**      | FAISS                | High-speed L2/IP vector similarity search        |
+| **Database**           | MongoDB & Motor      | Async profile storage & event logging with TTL   |
+| **Computer Vision**    | OpenCV               | Frame processing, blur detection & web streaming |
+| **Server & Real-Time** | Uvicorn & WebSockets | ASGI server and WebSocket communication          |
+| **Configuration**      | Pydantic Settings    | Environment-driven settings management           |
 
 ---
 
@@ -114,22 +114,22 @@ cp .env.example .env
 
 Key configuration parameters in `.env`:
 
-| Parameter | Default | Description |
-|---|---|---|
-| `HOST` | `0.0.0.0` | Server listen host |
-| `PORT` | `8000` | Server listen port |
-| `MONGO_URI` | `mongodb://localhost:27017` | MongoDB connection URI |
-| `MONGO_DB_NAME` | `face_recognition_db` | MongoDB database name |
-| `CROP_DIR` | `./crops` | Path to store detected face crops |
-| `DET_WIDTH` / `DET_HEIGHT` | `640` / `640` | Face detector input resolution |
-| `DET_THRESH` | `0.3` | Minimum face detection threshold |
-| `SAMPLE_FPS` | `6` | Frame sampling rate for AI inference |
-| `MIN_BLUR_VAR` | `100.0` | Minimum Laplacian variance for blur filter |
-| `HIGH_CONF_THRESH` | `0.55` | Confidence threshold for profile matching |
-| `LOW_CONF_THRESH` | `0.40` | Threshold below which auto-enrollment triggers |
-| `VISIT_COOLDOWN_MINS` | `3` | Duplicate alert suppression window (minutes) |
-| `RETENTION_DAYS` | `30` | Data retention period for logs and crop images |
-| `RTSP_STREAMS` | `""` | Comma-separated list of RTSP URLs for auto-start |
+| Parameter                  | Default                     | Description                                      |
+| -------------------------- | --------------------------- | ------------------------------------------------ |
+| `HOST`                     | `0.0.0.0`                   | Server listen host                               |
+| `PORT`                     | `8000`                      | Server listen port                               |
+| `MONGO_URI`                | `mongodb://localhost:27017` | MongoDB connection URI                           |
+| `MONGO_DB_NAME`            | `face_recognition_db`       | MongoDB database name                            |
+| `CROP_DIR`                 | `./crops`                   | Path to store detected face crops                |
+| `DET_WIDTH` / `DET_HEIGHT` | `640` / `640`               | Face detector input resolution                   |
+| `DET_THRESH`               | `0.3`                       | Minimum face detection threshold                 |
+| `SAMPLE_FPS`               | `6`                         | Frame sampling rate for AI inference             |
+| `MIN_BLUR_VAR`             | `100.0`                     | Minimum Laplacian variance for blur filter       |
+| `HIGH_CONF_THRESH`         | `0.55`                      | Confidence threshold for profile matching        |
+| `LOW_CONF_THRESH`          | `0.40`                      | Threshold below which auto-enrollment triggers   |
+| `VISIT_COOLDOWN_MINS`      | `3`                         | Duplicate alert suppression window (minutes)     |
+| `RETENTION_DAYS`           | `30`                        | Data retention period for logs and crop images   |
+| `RTSP_STREAMS`             | `""`                        | Comma-separated list of RTSP URLs for auto-start |
 
 ---
 
@@ -166,6 +166,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 - **Server URL**: `http://localhost:8000`
 - **Swagger API Docs**: `http://localhost:8000/docs`
 - **Web Stream Dashboard**: `http://localhost:8000/stream`
+
 ---
 
 ## 📡 API Endpoints
@@ -177,6 +178,7 @@ GET /health
 ```
 
 **Response:**
+
 ```json
 {
   "status": "ok",
@@ -258,3 +260,5 @@ This project is licensed under the MIT License.
 
 ---
 
+source venv/bin/activate
+python main.py
