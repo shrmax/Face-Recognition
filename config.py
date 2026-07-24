@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     # Sampling & Performance
     SAMPLE_FPS: int = 12  # AI Detection & Tracking FPS
     WATCHDOG_TIMEOUT_SECONDS: float = 5.0
+    REVERIFY_INTERVAL_SECONDS: float = 45.0
     SOCKET_MAX_WIDTH: int = 1280  # 720p max width for WebSocket streaming output
     SOCKET_MAX_HEIGHT: int = 720  # 720p max height for WebSocket streaming output
     

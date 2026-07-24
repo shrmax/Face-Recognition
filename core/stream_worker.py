@@ -10,6 +10,7 @@ from typing import Optional, Dict, Any, Tuple
 from config import settings
 from core.tracker import StreamTrackManager
 from core.quality import quality_filter
+from core.person_detector import detect_persons
 from insightface.app import FaceAnalysis
 
 logger = logging.getLogger("stream_worker")
@@ -194,42 +195,23 @@ class StreamWorker:
             self._run_ai_pipeline(frame_to_process)
 
     def _run_ai_pipeline(self, frame: np.ndarray):
-        """Runs SCRFD detection, ByteTrack tracking, and enqueues qualified face crops"""
+        """Runs YOLOv8 person detection, ByteTrack tracking, and enqueues person crops for face recognition"""
         try:
-            # 1. SCRFD Face Detection (supports 100+ crowd faces in frame)
-            with detector_lock:
-                if settings.MAX_FACES > 0:
-                    faces = self.detector.get(frame, max_num=settings.MAX_FACES)
-                else:
-                    faces = self.detector.get(frame)
+            person_boxes = detect_persons(frame)
 
-            # 2. ByteTrack Tracking Update
-            tracked_detections, pending_jobs = self.track_manager.update(faces, frame.shape)
+            tracked_detections, pending_jobs, reverify_jobs = self.track_manager.update(person_boxes, frame.shape)
 
-            # 3. Quality Filtering & Enqueueing Pending Recognition Jobs
-            h_img, w_img = frame.shape[:2]
-            for track_id, (x1, y1, x2, y2), embedding in pending_jobs:
+            for track_id, (x1, y1, x2, y2) in (pending_jobs + reverify_jobs):
                 crop = frame[y1:y2, x1:x2].copy()
-                is_passed, blur_score, reason = quality_filter.evaluate_quality(crop)
-                
-                if is_passed:
-                    # Enqueue crop job into thread-safe asyncio queue
-                    job_data = {
-                        "camera_id": self.camera_id,
-                        "track_id": track_id,
-                        "crop": crop,
-                        "bbox": [x1, y1, x2, y2],
-                        "embedding": embedding,
-                        "stream_worker": self
-                    }
-                    asyncio.run_coroutine_threadsafe(self.job_queue.put(job_data), self.loop)
-                else:
-                    logger.debug(f"[{self.camera_id}] Track #{track_id} failed quality check: {reason}")
-                    # Reset state so next frame of track can retry quality check
-                    if track_id in self.track_manager.track_states:
-                        del self.track_manager.track_states[track_id]
+                job_data = {
+                    "camera_id": self.camera_id,
+                    "track_id": track_id,
+                    "crop": crop,
+                    "bbox": [x1, y1, x2, y2],
+                    "stream_worker": self
+                }
+                asyncio.run_coroutine_threadsafe(self.job_queue.put(job_data), self.loop)
 
-            # 4. Save active tracking overlays
             labels = []
             if tracked_detections.tracker_id is not None and len(tracked_detections.tracker_id) > 0:
                 for tid in tracked_detections.tracker_id:

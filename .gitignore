@@ -11,10 +11,12 @@ ENV/
 # Environment Variables
 .env
 
-# Face Database
+# Face Database & AI Models
 faiss_index.bin
 known_ids.pkl
 known_embeddings.pkl
+*.pt
+*.onnx
 
 # Dataset
 Employee/

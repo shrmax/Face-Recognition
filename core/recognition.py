@@ -10,6 +10,7 @@ from typing import Dict, List, Tuple, Optional, TypedDict, TYPE_CHECKING
 from config import settings
 from database.mongo import mongo_db
 from database.storage import crop_storage
+from core.quality import quality_filter
 from insightface.app import FaceAnalysis
 
 if TYPE_CHECKING:
@@ -20,7 +21,6 @@ class JobData(TypedDict):
     track_id: int
     crop: np.ndarray
     bbox: List[int]
-    embedding: np.ndarray
     stream_worker: 'StreamWorker'
 
 logger = logging.getLogger("recognition")
@@ -123,19 +123,52 @@ class RecognitionWorker:
     async def _process_job(self, job: JobData):
         camera_id = job["camera_id"]
         track_id = job["track_id"]
-        crop = job["crop"]
+        person_crop = job["crop"]
         bbox = job["bbox"]
         stream_worker = job["stream_worker"]
-        raw_emb = job.get("embedding")
 
-        if raw_emb is None:
+        if person_crop is None or person_crop.size == 0:
+            stream_worker.track_manager.mark_retry(track_id)
             return
 
-        emb = np.array(raw_emb, dtype=np.float32)
+        if self.detector is None:
+            return
+
+        faces = self.detector.get(person_crop)
+        if not faces:
+            stream_worker.track_manager.mark_retry(track_id)
+            return
+
+        face = max(faces, key=lambda f: float(getattr(f, 'det_score', 0.0)))
+        fx1, fy1, fx2, fy2 = face.bbox.astype(int)
+        fx1, fy1 = max(0, fx1), max(0, fy1)
+        face_crop = person_crop[fy1:fy2, fx1:fx2]
+
+        is_passed, blur_score, reason = quality_filter.evaluate_quality(face_crop)
+        if not is_passed:
+            logger.debug(f"[{camera_id}] Track #{track_id} face quality check failed: {reason}")
+            stream_worker.track_manager.mark_retry(track_id)
+            return
+
+        # Check if track identity is already locked for this track_id
+        existing_identity = stream_worker.track_manager.track_identities.get(track_id)
+        if existing_identity is not None and existing_identity.get("status") == "processed":
+            current_profile_id = existing_identity.get("profile_id", "Unknown")
+            if current_profile_id not in ("Unknown", "Pending"):
+                # Identity is locked for the duration of this track. Keep existing identity without changing/flickering.
+                stream_worker.track_manager.set_track_identity(
+                    track_id,
+                    current_profile_id,
+                    existing_identity.get("label", f"#{track_id} {current_profile_id}"),
+                    is_new_visit=False
+                )
+                return
+
+        emb = face.embedding
         sim, best_profile_id = faiss_manager.search(emb)
 
         now = datetime.now(timezone.utc)
-        crop_file_path = crop_storage.save_crop(crop, best_profile_id, track_id)
+        crop_file_path = crop_storage.save_crop(person_crop, best_profile_id, track_id)
 
         if sim >= settings.HIGH_CONF_THRESH:
             # Clear low confidence count for high confidence match
@@ -154,14 +187,14 @@ class RecognitionWorker:
 
             if not in_cooldown:
                 event_doc = {
-                    "camera_id": str(camera_id),
-                    "track_id": int(track_id),
-                    "profile_id": str(best_profile_id),
-                    "confidence": float(sim),
+                    "camera_id": camera_id,
+                    "track_id": track_id,
+                    "profile_id": best_profile_id,
+                    "confidence": sim,
                     "event_type": "KNOWN_IDENTITY",
                     "timestamp": now,
                     "bbox": [int(x) for x in bbox],
-                    "crop_path": str(crop_file_path),
+                    "crop_path": crop_file_path,
                     "review_required": False
                 }
                 await mongo_db.save_detection_event(event_doc)
@@ -177,14 +210,14 @@ class RecognitionWorker:
             stream_worker.track_manager.set_track_identity(track_id, "Review_Required", label, is_new_visit=True)
 
             event_doc = {
-                "camera_id": str(camera_id),
-                "track_id": int(track_id),
-                "profile_id": str(best_profile_id),
-                "confidence": float(sim),
+                "camera_id": camera_id,
+                "track_id": track_id,
+                "profile_id": best_profile_id,
+                "confidence": sim,
                 "event_type": "UNCERTAIN_CANDIDATE",
                 "timestamp": now,
                 "bbox": [int(x) for x in bbox],
-                "crop_path": str(crop_file_path),
+                "crop_path": crop_file_path,
                 "review_required": True
             }
             await mongo_db.save_detection_event(event_doc)
@@ -216,17 +249,17 @@ class RecognitionWorker:
             stream_worker.track_manager.set_track_identity(track_id, new_profile_id, label, is_new_visit=True)
             
             # Save crop with new profile_id folder name
-            new_crop_path = crop_storage.save_crop(crop, new_profile_id, track_id)
+            new_crop_path = crop_storage.save_crop(person_crop, new_profile_id, track_id)
 
             event_doc = {
-                "camera_id": str(camera_id),
-                "track_id": int(track_id),
-                "profile_id": str(new_profile_id),
-                "confidence": float(sim),
+                "camera_id": camera_id,
+                "track_id": track_id,
+                "profile_id": new_profile_id,
+                "confidence": sim,
                 "event_type": "NEW_IDENTITY",
                 "timestamp": now,
                 "bbox": [int(x) for x in bbox],
-                "crop_path": str(new_crop_path),
+                "crop_path": new_crop_path,
                 "review_required": False
             }
             await mongo_db.save_detection_event(event_doc)
