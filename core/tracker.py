@@ -25,26 +25,29 @@ def _compute_iou(box1: np.ndarray, box2: List[int]) -> float:
 
 class TrackState:
     PENDING = "PENDING"
-    PROCESSED = "PROCESSED"
+    RESOLVED = "RESOLVED"  # Name is locked, no more recognition jobs needed
 
 class StreamTrackManager:
-    def __init__(self, camera_id: str):
+    def __init__(self, camera_id: str, frame_rate: int = settings.TRACKING_FPS):
         self.camera_id = camera_id
         # sv.ByteTrack instance for persistent object tracking
         self.byte_tracker = sv.ByteTrack(
             track_activation_threshold=0.15,
             lost_track_buffer=180,
             minimum_matching_threshold=0.2,
-            frame_rate=settings.SAMPLE_FPS
+            frame_rate=frame_rate
         )
-        # track_id -> status dict
+        # track_id -> status dict (PENDING vs RESOLVED)
         self.track_states: Dict[int, str] = {}
         # track_id -> assigned profile_id & label info
         self.track_identities: Dict[int, Dict[str, str]] = {}
-        # track_id -> timestamp of last successful recognition verification
-        self.track_last_verified: Dict[int, float] = {}
-        # track_id -> count of consecutive low-confidence evaluations for debounced auto-enrollment
+        # track_id -> count of consecutive low-confidence evaluations
         self.track_low_conf_counts: Dict[int, int] = {}
+        # track_id -> timestamp of last queued recognition job for rate-limiting
+        self.last_job_times: Dict[int, float] = {}
+        
+        # Spatial Memory for persistent Re-ID across track ID churn
+        self.spatial_memory: List[Dict[str, object]] = []
         
         # Annotators for visualization overlay
         self.box_annotator = sv.BoxAnnotator(thickness=2, color_lookup=sv.ColorLookup.INDEX)
@@ -53,34 +56,57 @@ class StreamTrackManager:
         # Profile ID -> Last Event Timestamp (Visit Cooldown)
         self.profile_cooldowns: Dict[str, datetime] = {}
 
+    def _spatial_reid_match(self, bbox: List[int]) -> Tuple[Optional[str], Optional[str]]:
+        """Matches a new track bounding box against recently active resolved identities in spatial memory."""
+        now = time.time()
+        valid_memory: List[Dict[str, object]] = []
+        for m in self.spatial_memory:
+            ts = m.get("timestamp")
+            if isinstance(ts, (int, float)) and (now - float(ts)) < 10.0:
+                valid_memory.append(m)
+        self.spatial_memory = valid_memory
+        
+        best_iou = 0.0
+        matched_pid: Optional[str] = None
+        matched_lbl: Optional[str] = None
+        
+        for mem in self.spatial_memory:
+            m_box = mem.get("bbox")
+            if isinstance(m_box, list) and len(m_box) == 4:
+                iou = _compute_iou(np.array(m_box), bbox)
+                if iou > 0.35 and iou > best_iou:
+                    best_iou = iou
+                    matched_pid = str(mem.get("profile_id", ""))
+                    matched_lbl = str(mem.get("label", ""))
+                    
+        if best_iou > 0.35 and matched_pid and matched_pid not in ("Unknown", "Pending"):
+            return matched_pid, matched_lbl
+        return None, None
+
     def update(
         self,
-        person_boxes: List[Tuple[Tuple[int, int, int, int], float]],
+        head_boxes: List[Tuple[Tuple[int, int, int, int], float]],
         frame_shape: Tuple[int, ...]
-    ) -> Tuple[
-        sv.Detections,
-        List[Tuple[int, Tuple[int, int, int, int]]],
-        List[Tuple[int, Tuple[int, int, int, int]]]
-    ]:
+    ) -> Tuple[sv.Detections, List[Tuple[int, Tuple[int, int, int, int]]]]:
         """
-        Updates ByteTrack with current frame's detected person bounding boxes.
+        Updates ByteTrack with current frame's detected head bounding boxes.
         Returns:
             - sv.Detections object for annotation overlay
-            - List of pending jobs for new tracks: [(track_id, (x1, y1, x2, y2))]
-            - List of reverify jobs for existing tracks: [(track_id, (x1, y1, x2, y2))]
+            - List of pending jobs for unresolved tracks: [(track_id, (x1, y1, x2, y2))]
         """
         now = time.time()
+        job_interval = 1.0 / settings.SAMPLE_FPS
         h_img, w_img = frame_shape[:2]
 
-        if not person_boxes:
+        if not head_boxes:
             empty_detections = sv.Detections.empty()
             tracked_detections = self.byte_tracker.update_with_detections(empty_detections)
-            return tracked_detections, [], []
+            return tracked_detections, []
 
         xyxy_list = []
         confidence_list = []
 
-        for (x1, y1, x2, y2), conf in person_boxes:
+        for (x1, y1, x2, y2), conf in head_boxes:
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(w_img, x2), min(h_img, y2)
             if (x2 - x1) < settings.MIN_FACE_SIZE or (y2 - y1) < settings.MIN_FACE_SIZE:
@@ -91,7 +117,7 @@ class StreamTrackManager:
         if not xyxy_list:
             empty_detections = sv.Detections.empty()
             tracked_detections = self.byte_tracker.update_with_detections(empty_detections)
-            return tracked_detections, [], []
+            return tracked_detections, []
 
         detections = sv.Detections(
             xyxy=np.array(xyxy_list),
@@ -101,7 +127,6 @@ class StreamTrackManager:
         tracked_detections = self.byte_tracker.update_with_detections(detections)
 
         pending_jobs = []
-        reverify_jobs = []
 
         if tracked_detections.tracker_id is not None:
             for idx, tracker_id in enumerate(tracked_detections.tracker_id):
@@ -110,17 +135,38 @@ class StreamTrackManager:
                 x1, y1, x2, y2 = max(0, bbox[0]), max(0, bbox[1]), min(w_img, bbox[2]), min(h_img, bbox[3])
 
                 if t_id not in self.track_states:
-                    self.track_states[t_id] = TrackState.PENDING
-                    self.track_identities[t_id] = {
-                        "label": f"Track #{t_id} (Processing...)",
-                        "profile_id": "Unknown",
-                        "status": "pending"
-                    }
-                    pending_jobs.append((t_id, (x1, y1, x2, y2)))
+                    matched_pid, matched_lbl = self._spatial_reid_match([x1, y1, x2, y2])
+                    if matched_pid and matched_lbl:
+                        self.track_states[t_id] = TrackState.RESOLVED
+                        clean_lbl = matched_lbl.split(' ', 1)[-1] if ' ' in matched_lbl else matched_lbl
+                        self.track_identities[t_id] = {
+                            "label": f"#{t_id} {clean_lbl}",
+                            "profile_id": matched_pid,
+                            "status": "resolved"
+                        }
+                    else:
+                        self.track_states[t_id] = TrackState.PENDING
+                        self.track_identities[t_id] = {
+                            "label": f"Track #{t_id}",
+                            "profile_id": "Unknown",
+                            "status": "pending"
+                        }
                 else:
-                    last_verified = self.track_last_verified.get(t_id, 0.0)
-                    if now - last_verified > settings.REVERIFY_INTERVAL_SECONDS:
-                        reverify_jobs.append((t_id, (x1, y1, x2, y2)))
+                    ident = self.track_identities.get(t_id, {})
+                    if ident.get("status") == "resolved" and ident.get("profile_id") not in ("Unknown", "Pending"):
+                        self.spatial_memory.append({
+                            "bbox": [x1, y1, x2, y2],
+                            "profile_id": ident.get("profile_id", ""),
+                            "label": ident.get("label", ""),
+                            "timestamp": now
+                        })
+
+                # Throttle recognition jobs per PENDING track to SAMPLE_FPS rate
+                if self.track_states[t_id] == TrackState.PENDING:
+                    last_job = self.last_job_times.get(t_id, 0.0)
+                    if (now - last_job) >= job_interval:
+                        self.last_job_times[t_id] = now
+                        pending_jobs.append((t_id, (x1, y1, x2, y2)))
 
         # Clean up stale track IDs
         active_ids = set(tracked_detections.tracker_id.tolist()) if tracked_detections.tracker_id is not None else set()
@@ -128,26 +174,21 @@ class StreamTrackManager:
         for tid in stale_ids:
             self.track_states.pop(tid, None)
             self.track_identities.pop(tid, None)
-            self.track_last_verified.pop(tid, None)
             self.track_low_conf_counts.pop(tid, None)
+            self.last_job_times.pop(tid, None)
 
-        return tracked_detections, pending_jobs, reverify_jobs
+        return tracked_detections, pending_jobs
 
     def set_track_identity(self, track_id: int, profile_id: str, label: str, is_new_visit: bool):
         """
-        Marks a track_id as PROCESSED and updates its label overlay.
+        Marks a track_id as RESOLVED and locks its label overlay for the track's lifetime.
         """
-        self.track_states[track_id] = TrackState.PROCESSED
+        self.track_states[track_id] = TrackState.RESOLVED
         self.track_identities[track_id] = {
             "label": label,
             "profile_id": profile_id,
-            "status": "processed"
+            "status": "resolved"
         }
-        self.track_last_verified[track_id] = time.time()
-
-    def mark_retry(self, track_id: int):
-        """Forces reverification on the next cycle (e.g. when no face was detected in person crop)."""
-        self.track_last_verified[track_id] = 0.0
 
     def check_visit_cooldown(self, profile_id: str) -> bool:
         """

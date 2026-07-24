@@ -26,14 +26,20 @@ class Settings(BaseSettings):
     KNOWN_IDS_PATH: str = "known_ids.pkl"
     EMBEDDINGS_PATH: str = "known_embeddings.pkl"
     
-    # SCRFD Face Detection Parameters (tuned for wide-angle overhead CCTV camera feeds)
+    # SCRFD Face & Head Detection Parameters (tuned for wide-angle overhead CCTV camera feeds)
+    HEAD_MODEL_PATH: str = "models/yolov11_phd_s.onnx"
+    HEAD_NET_SCALE_FACTOR: float = 0.0039215697906911373
+    HEAD_DET_SIZE: int = 640
+    HEAD_DET_CONF: float = 0.2
+    HEAD_DET_IOU: float = 0.6
     DET_WIDTH: int = 1280
     DET_HEIGHT: int = 1280
     DET_THRESH: float = 0.20
     MAX_FACES: int = 0  # 0 = unlimited face detection (100+ crowd per frame)
     
     # Sampling & Performance
-    SAMPLE_FPS: int = 12  # AI Detection & Tracking FPS
+    SAMPLE_FPS: int = 12  # AI Recognition Job Dispatch FPS
+    TRACKING_FPS: int = 15 # Head Detection & ByteTrack Update FPS
     WATCHDOG_TIMEOUT_SECONDS: float = 5.0
     REVERIFY_INTERVAL_SECONDS: float = 45.0
     SOCKET_MAX_WIDTH: int = 1280  # 720p max width for WebSocket streaming output
@@ -41,7 +47,8 @@ class Settings(BaseSettings):
     
     # Quality & Blur Filtering
     MIN_BLUR_VAR: float = 15.0   # Laplacian variance threshold
-    MIN_FACE_SIZE: int = 12      # Min bounding box width/height in pixels for small distant faces
+    MIN_FACE_SIZE: int = 12      # Min bounding box width/height in pixels for head detector
+    MIN_FACE_CROP_SIZE: int = 15 # Min face crop width/height in pixels for quality filter
     
     # FAISS Dual Thresholds & Multi-Vector Gallery
     HIGH_CONF_THRESH: float = 0.42  # Match threshold for known profile (optimized for RTSP video)

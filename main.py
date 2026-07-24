@@ -58,8 +58,8 @@ async def lifespan(app: FastAPI):
     # 3. Create Async Job Queue & Start Recognition Workers
     recognition_job_queue = asyncio.Queue(maxsize=100)
     detector = get_face_detector()
-    from core.person_detector import get_person_detector
-    get_person_detector()
+    from core.head_detector import get_head_session
+    get_head_session()
     recognition_worker = RecognitionWorker(recognition_job_queue, detector)
     await recognition_worker.start_worker_pool(num_workers=2)
     

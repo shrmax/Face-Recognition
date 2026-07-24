@@ -44,21 +44,20 @@ class TestVisionPipeline(unittest.TestCase):
     def test_tracker_state_transitions(self):
         tracker = StreamTrackManager("TEST_CAM")
         
-        person_boxes = [((50, 50, 150, 150), 0.9)]
-        tracked_detections, pending_jobs, reverify_jobs = tracker.update(person_boxes, (480, 640, 3))
+        head_boxes = [((50, 50, 150, 150), 0.9)]
+        tracked_detections, pending_jobs = tracker.update(head_boxes, (480, 640, 3))
         
         self.assertEqual(len(pending_jobs), 1)
         track_id, bbox = pending_jobs[0]
         self.assertEqual(tracker.track_states[track_id], "PENDING")
 
-        # Set track identity to PROCESSED
+        # Set track identity to RESOLVED once high confidence is reached
         tracker.set_track_identity(track_id, "EMP_001", "EMP_001 (0.95)", is_new_visit=True)
-        self.assertEqual(tracker.track_states[track_id], "PROCESSED")
+        self.assertEqual(tracker.track_states[track_id], "RESOLVED")
 
-        # Next frame with same track should yield 0 pending jobs and 0 reverify jobs
-        tracked_detections2, pending_jobs2, reverify_jobs2 = tracker.update(person_boxes, (480, 640, 3))
-        self.assertEqual(len(pending_jobs2), 0, "Frame Gating should suppress re-ID jobs for processed tracks")
-        self.assertEqual(len(reverify_jobs2), 0)
+        # Next frame with same track should yield 0 pending jobs (no further recognition jobs needed)
+        tracked_detections2, pending_jobs2 = tracker.update(head_boxes, (480, 640, 3))
+        self.assertEqual(len(pending_jobs2), 0, "Resolved tracks should suppress further recognition jobs")
 
 if __name__ == "__main__":
     unittest.main()

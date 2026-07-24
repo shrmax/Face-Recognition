@@ -1,6 +1,7 @@
 import os
 import cv2
 import time
+import base64
 import asyncio
 import logging
 import threading
@@ -8,9 +9,9 @@ import numpy as np
 import supervision as sv
 from typing import Optional, Dict, Any, Tuple
 from config import settings
-from core.tracker import StreamTrackManager
+from core.tracker import StreamTrackManager, TrackState
 from core.quality import quality_filter
-from core.person_detector import detect_persons
+from core.head_detector import detect_heads
 from insightface.app import FaceAnalysis
 
 logger = logging.getLogger("stream_worker")
@@ -49,23 +50,29 @@ class StreamWorker:
         self.cap: Optional[cv2.VideoCapture] = None
         self.cap_lock = threading.Lock()
         
-        self.track_manager = StreamTrackManager(camera_id)
+        self.track_manager = StreamTrackManager(camera_id, frame_rate=settings.TRACKING_FPS)
         self.detector = get_face_detector()
         
         self.last_raw_frame: Optional[np.ndarray] = None
         self.active_tracked_detections = None
         self.active_labels = []
+        self.latest_encoded_b64: Optional[str] = None
         self.last_frame_timestamp = time.time()
         self.frame_lock = threading.Lock()
         
         self.reconnect_count = 0
         self._first_frame_received = False
         
-        # Start capture thread, AI processing thread, and watchdog thread
+        # Start capture thread, tracking thread, AI recognition job dispatch thread, and watchdog thread
         self.capture_thread = threading.Thread(
             target=self._capture_loop,
             daemon=True,
             name=f"Capture_{camera_id}"
+        )
+        self.tracking_thread = threading.Thread(
+            target=self._tracking_loop,
+            daemon=True,
+            name=f"Tracking_{camera_id}"
         )
         self.ai_thread = threading.Thread(
             target=self._ai_processing_loop,
@@ -79,6 +86,7 @@ class StreamWorker:
         )
         
         self.capture_thread.start()
+        self.tracking_thread.start()
         self.ai_thread.start()
         self.watchdog_thread.start()
 
@@ -180,92 +188,119 @@ class StreamWorker:
 
             time.sleep(0.001)
 
+    def _tracking_loop(self):
+        """High-frequency tracking loop (~TRACKING_FPS): runs ONNX head detection & ByteTrack on fresh raw frames"""
+        interval = 1.0 / max(1, settings.TRACKING_FPS)
+        while self.running:
+            t0 = time.time()
+            with self.frame_lock:
+                frame_to_process = self.last_raw_frame.copy() if self.last_raw_frame is not None else None
+
+            if frame_to_process is not None:
+                try:
+                    head_boxes = detect_heads(frame_to_process)
+                    tracked_detections, _ = self.track_manager.update(head_boxes, frame_to_process.shape)
+
+                    labels = []
+                    if tracked_detections.tracker_id is not None and len(tracked_detections.tracker_id) > 0:
+                        for tid in tracked_detections.tracker_id:
+                            tid_int = int(tid)
+                            ident = self.track_manager.track_identities.get(tid_int, {})
+                            labels.append(ident.get("label", f"Track #{tid_int}"))
+
+                    # Pre-render annotations & encode JPEG to Base64 in background tracking thread
+                    frame_to_render = frame_to_process.copy()
+                    if tracked_detections is not None and len(tracked_detections) > 0:
+                        if tracked_detections.tracker_id is not None and len(tracked_detections.tracker_id) == len(tracked_detections):
+                            labels_to_render = labels
+                        else:
+                            labels_to_render = ["Detecting..."] * len(tracked_detections)
+
+                        frame_to_render = self.track_manager.box_annotator.annotate(
+                            scene=frame_to_render,
+                            detections=tracked_detections
+                        )
+                        frame_to_render = self.track_manager.label_annotator.annotate(
+                            scene=frame_to_render,
+                            detections=tracked_detections,
+                            labels=labels_to_render
+                        )
+                        frame_to_render = np.asarray(frame_to_render)
+
+                    if settings.SOCKET_MAX_WIDTH > 0 and settings.SOCKET_MAX_HEIGHT > 0:
+                        h_f, w_f = frame_to_render.shape[:2]
+                        if w_f > settings.SOCKET_MAX_WIDTH or h_f > settings.SOCKET_MAX_HEIGHT:
+                            scale = min(settings.SOCKET_MAX_WIDTH / w_f, settings.SOCKET_MAX_HEIGHT / h_f)
+                            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+                            frame_to_render = cv2.resize(frame_to_render, (int(w_f * scale), int(h_f * scale)), interpolation=interp)
+
+                    _, buffer = cv2.imencode('.jpg', frame_to_render, [cv2.IMWRITE_JPEG_QUALITY, 55])
+                    b64_encoded = base64.b64encode(buffer).decode('utf-8')
+
+                    with self.frame_lock:
+                        self.active_tracked_detections = tracked_detections
+                        self.active_labels = labels
+                        self.latest_encoded_b64 = b64_encoded
+
+                except Exception as e:
+                    logger.error(f"[{self.camera_id}] Error in tracking loop: {e}")
+
+            elapsed = time.time() - t0
+            if elapsed > interval:
+                logger.debug(f"[{self.camera_id}] Tracking loop iteration took {elapsed * 1000:.1f}ms (budget {interval * 1000:.1f}ms)")
+            sleep_time = max(0.001, interval - elapsed)
+            time.sleep(sleep_time)
+
     def _ai_processing_loop(self):
-        """Dedicated AI loop: processes latest frame at SAMPLE_FPS without blocking RTSP capture"""
-        sample_interval = 1.0 / settings.SAMPLE_FPS
-        
+        """Recognition job dispatch loop (~SAMPLE_FPS): checks PENDING tracks and dispatches recognition jobs to async queue"""
+        sample_interval = 1.0 / max(1, settings.SAMPLE_FPS)
         while self.running:
             time.sleep(sample_interval)
             
             with self.frame_lock:
-                if self.last_raw_frame is None:
+                if self.last_raw_frame is None or self.active_tracked_detections is None:
                     continue
-                frame_to_process = self.last_raw_frame.copy()
+                frame = self.last_raw_frame.copy()
+                detections = self.active_tracked_detections
 
-            self._run_ai_pipeline(frame_to_process)
+            if detections.tracker_id is None or len(detections.tracker_id) == 0:
+                continue
 
-    def _run_ai_pipeline(self, frame: np.ndarray):
-        """Runs YOLOv8 person detection, ByteTrack tracking, and enqueues person crops for face recognition"""
-        try:
-            person_boxes = detect_persons(frame)
+            h_img, w_img = frame.shape[:2]
+            now = time.time()
+            job_interval = 1.0 / max(1, settings.SAMPLE_FPS)
 
-            tracked_detections, pending_jobs, reverify_jobs = self.track_manager.update(person_boxes, frame.shape)
+            for idx, tracker_id in enumerate(detections.tracker_id):
+                t_id = int(tracker_id)
+                if self.track_manager.track_states.get(t_id) == TrackState.PENDING:
+                    last_job = self.track_manager.last_job_times.get(t_id, 0.0)
+                    if (now - last_job) >= job_interval:
+                        self.track_manager.last_job_times[t_id] = now
+                        bbox = detections.xyxy[idx].astype(int)
+                        x1, y1 = max(0, int(bbox[0])), max(0, int(bbox[1]))
+                        x2, y2 = min(w_img, int(bbox[2])), min(h_img, int(bbox[3]))
+                        if (x2 - x1) < settings.MIN_FACE_SIZE or (y2 - y1) < settings.MIN_FACE_SIZE:
+                            continue
+                        
+                        crop = frame[y1:y2, x1:x2].copy()
+                        if crop.size == 0 or crop.shape[0] == 0 or crop.shape[1] == 0:
+                            continue
 
-            for track_id, (x1, y1, x2, y2) in (pending_jobs + reverify_jobs):
-                crop = frame[y1:y2, x1:x2].copy()
-                job_data = {
-                    "camera_id": self.camera_id,
-                    "track_id": track_id,
-                    "crop": crop,
-                    "bbox": [x1, y1, x2, y2],
-                    "stream_worker": self
-                }
-                asyncio.run_coroutine_threadsafe(self.job_queue.put(job_data), self.loop)
-
-            labels = []
-            if tracked_detections.tracker_id is not None and len(tracked_detections.tracker_id) > 0:
-                for tid in tracked_detections.tracker_id:
-                    tid_int = int(tid)
-                    ident = self.track_manager.track_identities.get(tid_int, {})
-                    labels.append(ident.get("label", f"Track #{tid_int}"))
-
-            with self.frame_lock:
-                self.active_tracked_detections = tracked_detections
-                self.active_labels = labels
-
-        except Exception as e:
-            logger.error(f"[{self.camera_id}] Error in AI pipeline: {e}")
+                        job_data = {
+                            "camera_id": self.camera_id,
+                            "track_id": t_id,
+                            "crop": crop,
+                            "bbox": [x1, y1, x2, y2],
+                            "stream_worker": self
+                        }
+                        try:
+                            asyncio.run_coroutine_threadsafe(self.job_queue.put(job_data), self.loop)
+                        except Exception as err:
+                            logger.error(f"[{self.camera_id}] Error enqueueing recognition job for Track #{t_id}: {err}")
 
     def get_latest_frame_b64(self) -> Optional[str]:
         with self.frame_lock:
-            if self.last_raw_frame is None:
-                return None
-            frame_copy = self.last_raw_frame.copy()
-            active_detections = self.active_tracked_detections
-            active_labels = self.active_labels
-
-        try:
-            # Annotate tracking bounding boxes onto the latest 30 FPS live frame
-            if active_detections is not None and len(active_detections) > 0:
-                if active_detections.tracker_id is not None and len(active_detections.tracker_id) == len(active_detections):
-                    labels_to_render = active_labels
-                else:
-                    labels_to_render = ["Detecting..."] * len(active_detections)
-
-                frame_copy = self.track_manager.box_annotator.annotate(
-                    scene=frame_copy,
-                    detections=active_detections
-                )
-                frame_copy = self.track_manager.label_annotator.annotate(
-                    scene=frame_copy,
-                    detections=active_detections,
-                    labels=labels_to_render
-                )
-                frame_copy = np.asarray(frame_copy)
-
-            # Downscale ONLY the WebSocket stream output frame to 480p (SOCKET_MAX_WIDTH/HEIGHT)
-            if settings.SOCKET_MAX_WIDTH > 0 and settings.SOCKET_MAX_HEIGHT > 0:
-                h_f, w_f = frame_copy.shape[:2]
-                if w_f > settings.SOCKET_MAX_WIDTH or h_f > settings.SOCKET_MAX_HEIGHT:
-                    scale = min(settings.SOCKET_MAX_WIDTH / w_f, settings.SOCKET_MAX_HEIGHT / h_f)
-                    frame_copy = cv2.resize(frame_copy, (int(w_f * scale), int(h_f * scale)), interpolation=cv2.INTER_AREA)
-
-            _, buffer = cv2.imencode('.jpg', frame_copy, [cv2.IMWRITE_JPEG_QUALITY, 55])
-            import base64
-            return base64.b64encode(buffer).decode('utf-8')
-        except Exception as e:
-            logger.error(f"Error encoding frame to base64: {e}")
-            return None
+            return self.latest_encoded_b64
 
     def stop(self):
         logger.info(f"[{self.camera_id}] Stopping stream worker...")

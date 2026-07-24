@@ -123,147 +123,64 @@ class RecognitionWorker:
     async def _process_job(self, job: JobData):
         camera_id = job["camera_id"]
         track_id = job["track_id"]
-        person_crop = job["crop"]
+        head_crop = job["crop"]
         bbox = job["bbox"]
         stream_worker = job["stream_worker"]
 
-        if person_crop is None or person_crop.size == 0:
-            stream_worker.track_manager.mark_retry(track_id)
-            return
+        if head_crop is None or head_crop.size == 0 or head_crop.shape[0] == 0 or head_crop.shape[1] == 0:
+            return  # stays PENDING, retries next cycle automatically
 
         if self.detector is None:
             return
 
-        faces = self.detector.get(person_crop)
+        faces = self.detector.get(head_crop)
+        logger.info(f"[{camera_id}] Track #{track_id} head_crop shape={head_crop.shape}, faces found={len(faces) if faces else 0}")
         if not faces:
-            stream_worker.track_manager.mark_retry(track_id)
-            return
+            return  # face not visible this frame — stays PENDING, retries next cycle automatically
 
         face = max(faces, key=lambda f: float(getattr(f, 'det_score', 0.0)))
         fx1, fy1, fx2, fy2 = face.bbox.astype(int)
         fx1, fy1 = max(0, fx1), max(0, fy1)
-        face_crop = person_crop[fy1:fy2, fx1:fx2]
+        face_crop = head_crop[fy1:fy2, fx1:fx2]
 
         is_passed, blur_score, reason = quality_filter.evaluate_quality(face_crop)
         if not is_passed:
-            logger.debug(f"[{camera_id}] Track #{track_id} face quality check failed: {reason}")
-            stream_worker.track_manager.mark_retry(track_id)
-            return
-
-        # Check if track identity is already locked for this track_id
-        existing_identity = stream_worker.track_manager.track_identities.get(track_id)
-        if existing_identity is not None and existing_identity.get("status") == "processed":
-            current_profile_id = existing_identity.get("profile_id", "Unknown")
-            if current_profile_id not in ("Unknown", "Pending"):
-                # Identity is locked for the duration of this track. Keep existing identity without changing/flickering.
-                stream_worker.track_manager.set_track_identity(
-                    track_id,
-                    current_profile_id,
-                    existing_identity.get("label", f"#{track_id} {current_profile_id}"),
-                    is_new_visit=False
-                )
-                return
+            logger.debug(f"[{camera_id}] Track #{track_id} face crop quality check failed: {reason}")
+            return  # stays PENDING, retries later when face becomes clear
 
         emb = face.embedding
         sim, best_profile_id = faiss_manager.search(emb)
-
         now = datetime.now(timezone.utc)
-        crop_file_path = crop_storage.save_crop(person_crop, best_profile_id, track_id)
 
         if sim >= settings.HIGH_CONF_THRESH:
-            # Clear low confidence count for high confidence match
-            stream_worker.track_manager.track_low_conf_counts.pop(track_id, None)
-            
-            # Match Known Profile
-            in_cooldown = stream_worker.track_manager.check_visit_cooldown(best_profile_id)
             name = faiss_manager.get_name(best_profile_id)
             label = f"#{track_id} {name} ({sim:.2f})"
-            stream_worker.track_manager.set_track_identity(track_id, best_profile_id, label, is_new_visit=not in_cooldown)
+            stream_worker.track_manager.set_track_identity(track_id, best_profile_id, label, is_new_visit=True)
+
+            # Save crop and log known identity detection event
+            crop_file_path = crop_storage.save_crop(face_crop, best_profile_id, track_id)
+            event_doc = {
+                "camera_id": camera_id,
+                "track_id": track_id,
+                "profile_id": best_profile_id,
+                "confidence": sim,
+                "event_type": "KNOWN_IDENTITY",
+                "timestamp": now,
+                "bbox": [int(x) for x in bbox],
+                "crop_path": crop_file_path,
+                "review_required": False
+            }
+            await mongo_db.save_detection_event(event_doc)
 
             # Progressive Learning: If sim is between 0.55 and 0.85, add vector to multi-vector gallery
             if settings.HIGH_CONF_THRESH <= sim < 0.85:
                 faiss_manager.add_vector(emb, best_profile_id, name)
                 await mongo_db.save_or_update_profile(best_profile_id, emb.tolist(), name)
 
-            if not in_cooldown:
-                event_doc = {
-                    "camera_id": camera_id,
-                    "track_id": track_id,
-                    "profile_id": best_profile_id,
-                    "confidence": sim,
-                    "event_type": "KNOWN_IDENTITY",
-                    "timestamp": now,
-                    "bbox": [int(x) for x in bbox],
-                    "crop_path": crop_file_path,
-                    "review_required": False
-                }
-                await mongo_db.save_detection_event(event_doc)
-                logger.info(f"[{camera_id}] KNOWN_IDENTITY Logged: Track #{track_id} {name} ({sim:.2f})")
+            faiss_manager.save_to_disk()
+            logger.info(f"[{camera_id}] KNOWN_IDENTITY Logged & RESOLVED: Track #{track_id} {name} ({sim:.2f})")
+            return
 
-        elif settings.LOW_CONF_THRESH <= sim < settings.HIGH_CONF_THRESH:
-            # Clear low confidence count for candidate match
-            stream_worker.track_manager.track_low_conf_counts.pop(track_id, None)
-
-            # Uncertain / Review Candidate
-            name = faiss_manager.get_name(best_profile_id)
-            label = f"#{track_id} {name}? ({sim:.2f})"
-            stream_worker.track_manager.set_track_identity(track_id, "Review_Required", label, is_new_visit=True)
-
-            event_doc = {
-                "camera_id": camera_id,
-                "track_id": track_id,
-                "profile_id": best_profile_id,
-                "confidence": sim,
-                "event_type": "UNCERTAIN_CANDIDATE",
-                "timestamp": now,
-                "bbox": [int(x) for x in bbox],
-                "crop_path": crop_file_path,
-                "review_required": True
-            }
-            await mongo_db.save_detection_event(event_doc)
-            logger.info(f"[{camera_id}] UNCERTAIN Logged: Track #{track_id} {name} ({sim:.2f})")
-
-        else:
-            # Debounce auto-enrollment: Require 2 consecutive low-confidence attempts before creating a new visitor profile
-            curr_count = stream_worker.track_manager.track_low_conf_counts.get(track_id, 0) + 1
-            stream_worker.track_manager.track_low_conf_counts[track_id] = curr_count
-
-            if curr_count < 2:
-                label = f"#{track_id} Evaluating..."
-                stream_worker.track_manager.set_track_identity(track_id, "Pending", label, is_new_visit=False)
-                # Reset track state to PENDING so next frame retries evaluation
-                stream_worker.track_manager.track_states[track_id] = "PENDING"
-                logger.debug(f"[{camera_id}] Track #{track_id} low confidence attempt {curr_count}/2 (sim {sim:.2f}). Debouncing auto-enroll.")
-                return
-
-            # Auto-Enroll New Identity (sim < LOW_CONF_THRESH after 2+ consistent attempts)
-            stream_worker.track_manager.track_low_conf_counts.pop(track_id, None)
-            self.counter += 1
-            new_profile_id = f"VISITOR_{now.strftime('%m%d')}_{self.counter}"
-            label = f"#{track_id} {new_profile_id} ({sim:.2f})"
-            
-            # Save new vector to FAISS and MongoDB
-            faiss_manager.add_vector(emb, new_profile_id, new_profile_id)
-            await mongo_db.save_or_update_profile(new_profile_id, emb.tolist(), new_profile_id)
-
-            stream_worker.track_manager.set_track_identity(track_id, new_profile_id, label, is_new_visit=True)
-            
-            # Save crop with new profile_id folder name
-            new_crop_path = crop_storage.save_crop(person_crop, new_profile_id, track_id)
-
-            event_doc = {
-                "camera_id": camera_id,
-                "track_id": track_id,
-                "profile_id": new_profile_id,
-                "confidence": sim,
-                "event_type": "NEW_IDENTITY",
-                "timestamp": now,
-                "bbox": [int(x) for x in bbox],
-                "crop_path": new_crop_path,
-                "review_required": False
-            }
-            await mongo_db.save_detection_event(event_doc)
-            logger.info(f"[{camera_id}] NEW_IDENTITY Auto-Enrolled & Logged: Track #{track_id} {new_profile_id}")
-
-        # Persist FAISS index periodically
-        faiss_manager.save_to_disk()
+        # sim below HIGH_CONF_THRESH: do NOT set_track_identity, do NOT lock in a name.
+        # Track remains PENDING — it will keep receiving jobs on future frames automatically
+        # until a high-confidence match is resolved.
