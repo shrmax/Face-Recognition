@@ -2,11 +2,26 @@ import time
 import logging
 import numpy as np
 import supervision as sv
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Protocol, Sequence
 from datetime import datetime, timedelta
 from config import settings
 
 logger = logging.getLogger("tracker")
+
+class FaceObject(Protocol):
+    det_score: float
+    bbox: np.ndarray
+    embedding: np.ndarray
+
+def _compute_iou(box1: np.ndarray, box2: List[int]) -> float:
+    x1 = max(int(box1[0]), box2[0])
+    y1 = max(int(box1[1]), box2[1])
+    x2 = min(int(box1[2]), box2[2])
+    y2 = min(int(box1[3]), box2[3])
+    inter_area = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = max(1, int((box1[2] - box1[0]) * (box1[3] - box1[1])))
+    area2 = max(1, (box2[2] - box2[0]) * (box2[3] - box2[1]))
+    return float(inter_area) / float(area1 + area2 - inter_area)
 
 class TrackState:
     PENDING = "PENDING"
@@ -18,7 +33,7 @@ class StreamTrackManager:
         # sv.ByteTrack instance for persistent object tracking
         self.byte_tracker = sv.ByteTrack(
             track_activation_threshold=0.15,
-            lost_track_buffer=30,
+            lost_track_buffer=60,
             minimum_matching_threshold=0.3,
             frame_rate=settings.SAMPLE_FPS
         )
@@ -26,6 +41,8 @@ class StreamTrackManager:
         self.track_states: Dict[int, str] = {}
         # track_id -> assigned profile_id & label info
         self.track_identities: Dict[int, Dict[str, str]] = {}
+        # track_id -> count of consecutive low-confidence evaluations for debounced auto-enrollment
+        self.track_low_conf_counts: Dict[int, int] = {}
         
         # Annotators for visualization overlay
         self.box_annotator = sv.BoxAnnotator(thickness=2, color_lookup=sv.ColorLookup.INDEX)
@@ -34,12 +51,12 @@ class StreamTrackManager:
         # Profile ID -> Last Event Timestamp (Visit Cooldown)
         self.profile_cooldowns: Dict[str, datetime] = {}
 
-    def update(self, faces: List[Any], frame_shape: Tuple[int, ...]) -> Tuple[sv.Detections, List[Tuple[int, Tuple[int, int, int, int]]]]:
+    def update(self, faces: Sequence[FaceObject], frame_shape: Tuple[int, ...]) -> Tuple[sv.Detections, List[Tuple[int, Tuple[int, int, int, int], np.ndarray]]]:
         """
         Updates ByteTrack with current frame's detected faces.
         Returns:
             - sv.Detections object for annotation overlay
-            - List of pending jobs: [(track_id, face_crop_bgr, face_bbox)]
+            - List of pending jobs: [(track_id, (x1, y1, x2, y2), embedding)]
         """
         if not faces:
             # Update tracker with empty detections to maintain Kalman filter updates
@@ -49,21 +66,26 @@ class StreamTrackManager:
 
         xyxy_list = []
         confidence_list = []
-        face_crops = []
+        embeddings_list = []
 
         h_img, w_img = frame_shape[:2]
 
         for face in faces:
-            if face.det_score < settings.DET_THRESH:
+            det_score = getattr(face, 'det_score', 0.0)
+            if det_score < settings.DET_THRESH:
                 continue
-            bbox = face.bbox.astype(int)
+            bbox_arr = getattr(face, 'bbox', None)
+            if bbox_arr is None:
+                continue
+            bbox = bbox_arr.astype(int)
             x1, y1, x2, y2 = max(0, bbox[0]), max(0, bbox[1]), min(w_img, bbox[2]), min(h_img, bbox[3])
             
             if (x2 - x1) < settings.MIN_FACE_SIZE or (y2 - y1) < settings.MIN_FACE_SIZE:
                 continue
                 
             xyxy_list.append([x1, y1, x2, y2])
-            confidence_list.append(face.det_score)
+            confidence_list.append(det_score)
+            embeddings_list.append(face.embedding)
 
         if not xyxy_list:
             empty_detections = sv.Detections.empty()
@@ -95,14 +117,20 @@ class StreamTrackManager:
                     bbox = tracked_detections.xyxy[idx].astype(int)
                     x1, y1, x2, y2 = max(0, bbox[0]), max(0, bbox[1]), min(w_img, bbox[2]), min(h_img, bbox[3])
                     
-                    pending_jobs.append((t_id, (x1, y1, x2, y2)))
+                    # Match tracked box back to nearest detection embedding via IoU
+                    ious = [_compute_iou(bbox, dbox) for dbox in xyxy_list]
+                    best_idx = int(np.argmax(ious)) if ious else 0
+                    matched_embedding = embeddings_list[best_idx]
+                    
+                    pending_jobs.append((t_id, (x1, y1, x2, y2), matched_embedding))
 
         # Clean up stale track IDs
         active_ids = set(tracked_detections.tracker_id.tolist()) if tracked_detections.tracker_id is not None else set()
         stale_ids = [tid for tid in list(self.track_states.keys()) if tid not in active_ids]
         for tid in stale_ids:
-            # We keep processed status for a buffer period or purge if expired
-            pass
+            self.track_states.pop(tid, None)
+            self.track_identities.pop(tid, None)
+            self.track_low_conf_counts.pop(tid, None)
 
         return tracked_detections, pending_jobs
 

@@ -49,13 +49,15 @@ class TestVisionPipeline(unittest.TestCase):
             def __init__(self, bbox, score):
                 self.bbox = np.array(bbox)
                 self.det_score = score
+                self.embedding = np.random.randn(512).astype(np.float32)
 
         faces = [DummyFace([50, 50, 150, 150], 0.9)]
         tracked_detections, pending_jobs = tracker.update(faces, (480, 640, 3))
         
         self.assertEqual(len(pending_jobs), 1)
-        track_id = pending_jobs[0][0]
+        track_id, bbox, embedding = pending_jobs[0]
         self.assertEqual(tracker.track_states[track_id], "PENDING")
+        self.assertEqual(len(embedding), 512)
 
         # Set track identity to PROCESSED
         tracker.set_track_identity(track_id, "EMP_001", "EMP_001 (0.95)", is_new_visit=True)

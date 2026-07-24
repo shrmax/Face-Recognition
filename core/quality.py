@@ -19,8 +19,10 @@ class FaceQualityFilter:
         if w < self.min_size or h < self.min_size:
             return False, 0.0, f"Crop size too small ({w}x{h} < {self.min_size}px)"
 
+        # Resize to normalized 128x128 for consistent Laplacian blur evaluation across distances
+        resized = cv2.resize(crop_bgr, (128, 128), interpolation=cv2.INTER_AREA)
         # Convert to grayscale for Laplacian blur variance calculation
-        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
         blur_score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
         if blur_score < self.min_blur_var:

@@ -6,11 +6,22 @@ import asyncio
 import logging
 import threading
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, TypedDict, TYPE_CHECKING
 from config import settings
 from database.mongo import mongo_db
 from database.storage import crop_storage
 from insightface.app import FaceAnalysis
+
+if TYPE_CHECKING:
+    from core.stream_worker import StreamWorker
+
+class JobData(TypedDict):
+    camera_id: str
+    track_id: int
+    crop: np.ndarray
+    bbox: List[int]
+    embedding: np.ndarray
+    stream_worker: 'StreamWorker'
 
 logger = logging.getLogger("recognition")
 
@@ -88,7 +99,7 @@ class FAISSIndexManager:
 faiss_manager = FAISSIndexManager()
 
 class RecognitionWorker:
-    def __init__(self, job_queue: asyncio.Queue, app_detector: FaceAnalysis):
+    def __init__(self, job_queue: asyncio.Queue, app_detector: Optional[FaceAnalysis] = None):
         self.job_queue = job_queue
         self.detector = app_detector
         self.running = True
@@ -109,25 +120,27 @@ class RecognitionWorker:
                 logger.error(f"Error in recognition worker {worker_id}: {e}")
                 await asyncio.sleep(0.05)
 
-    async def _process_job(self, job: Dict[str, Any]):
+    async def _process_job(self, job: JobData):
         camera_id = job["camera_id"]
         track_id = job["track_id"]
         crop = job["crop"]
         bbox = job["bbox"]
         stream_worker = job["stream_worker"]
+        raw_emb = job.get("embedding")
 
-        # Run ArcFace Feature Extraction
-        faces = self.detector.get(crop, max_num=1)
-        if not faces or len(faces) == 0:
+        if raw_emb is None:
             return
 
-        emb = faces[0].embedding
+        emb = np.array(raw_emb, dtype=np.float32)
         sim, best_profile_id = faiss_manager.search(emb)
 
         now = datetime.now(timezone.utc)
         crop_file_path = crop_storage.save_crop(crop, best_profile_id, track_id)
 
         if sim >= settings.HIGH_CONF_THRESH:
+            # Clear low confidence count for high confidence match
+            stream_worker.track_manager.track_low_conf_counts.pop(track_id, None)
+            
             # Match Known Profile
             in_cooldown = stream_worker.track_manager.check_visit_cooldown(best_profile_id)
             name = faiss_manager.get_name(best_profile_id)
@@ -142,12 +155,12 @@ class RecognitionWorker:
             if not in_cooldown:
                 event_doc = {
                     "camera_id": camera_id,
-                    "track_id": int(track_id),
+                    "track_id": track_id,
                     "profile_id": best_profile_id,
                     "confidence": sim,
                     "event_type": "KNOWN_IDENTITY",
                     "timestamp": now,
-                    "bbox": [int(x) for x in bbox],
+                    "bbox": list(bbox),
                     "crop_path": crop_file_path,
                     "review_required": False
                 }
@@ -155,6 +168,9 @@ class RecognitionWorker:
                 logger.info(f"[{camera_id}] KNOWN_IDENTITY Logged: Track #{track_id} {name} ({sim:.2f})")
 
         elif settings.LOW_CONF_THRESH <= sim < settings.HIGH_CONF_THRESH:
+            # Clear low confidence count for candidate match
+            stream_worker.track_manager.track_low_conf_counts.pop(track_id, None)
+
             # Uncertain / Review Candidate
             name = faiss_manager.get_name(best_profile_id)
             label = f"#{track_id} {name}? ({sim:.2f})"
@@ -162,12 +178,12 @@ class RecognitionWorker:
 
             event_doc = {
                 "camera_id": camera_id,
-                "track_id": int(track_id),
+                "track_id": track_id,
                 "profile_id": best_profile_id,
                 "confidence": sim,
                 "event_type": "UNCERTAIN_CANDIDATE",
                 "timestamp": now,
-                "bbox": [int(x) for x in bbox],
+                "bbox": list(bbox),
                 "crop_path": crop_file_path,
                 "review_required": True
             }
@@ -175,7 +191,20 @@ class RecognitionWorker:
             logger.info(f"[{camera_id}] UNCERTAIN Logged: Track #{track_id} {name} ({sim:.2f})")
 
         else:
-            # Auto-Enroll New Identity (sim < 0.40)
+            # Debounce auto-enrollment: Require 2 consecutive low-confidence attempts before creating a new visitor profile
+            curr_count = stream_worker.track_manager.track_low_conf_counts.get(track_id, 0) + 1
+            stream_worker.track_manager.track_low_conf_counts[track_id] = curr_count
+
+            if curr_count < 2:
+                label = f"#{track_id} Evaluating..."
+                stream_worker.track_manager.set_track_identity(track_id, "Pending", label, is_new_visit=False)
+                # Reset track state to PENDING so next frame retries evaluation
+                stream_worker.track_manager.track_states[track_id] = "PENDING"
+                logger.debug(f"[{camera_id}] Track #{track_id} low confidence attempt {curr_count}/2 (sim {sim:.2f}). Debouncing auto-enroll.")
+                return
+
+            # Auto-Enroll New Identity (sim < LOW_CONF_THRESH after 2+ consistent attempts)
+            stream_worker.track_manager.track_low_conf_counts.pop(track_id, None)
             self.counter += 1
             new_profile_id = f"VISITOR_{now.strftime('%m%d')}_{self.counter}"
             label = f"#{track_id} {new_profile_id} ({sim:.2f})"
@@ -191,12 +220,12 @@ class RecognitionWorker:
 
             event_doc = {
                 "camera_id": camera_id,
-                "track_id": int(track_id),
+                "track_id": track_id,
                 "profile_id": new_profile_id,
                 "confidence": sim,
                 "event_type": "NEW_IDENTITY",
                 "timestamp": now,
-                "bbox": [int(x) for x in bbox],
+                "bbox": list(bbox),
                 "crop_path": new_crop_path,
                 "review_required": False
             }

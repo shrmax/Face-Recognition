@@ -25,7 +25,7 @@ def get_face_detector() -> FaceAnalysis:
             if face_detector is None:
                 app = FaceAnalysis(
                     name='buffalo_m',
-                    providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
+                    providers=['CUDAExecutionProvider', 'CoreMLExecutionProvider', 'CPUExecutionProvider'],
                     allowed_modules=['detection', 'recognition']
                 )
                 app.prepare(
@@ -208,7 +208,7 @@ class StreamWorker:
 
             # 3. Quality Filtering & Enqueueing Pending Recognition Jobs
             h_img, w_img = frame.shape[:2]
-            for track_id, (x1, y1, x2, y2) in pending_jobs:
+            for track_id, (x1, y1, x2, y2), embedding in pending_jobs:
                 crop = frame[y1:y2, x1:x2].copy()
                 is_passed, blur_score, reason = quality_filter.evaluate_quality(crop)
                 
@@ -219,6 +219,7 @@ class StreamWorker:
                         "track_id": track_id,
                         "crop": crop,
                         "bbox": [x1, y1, x2, y2],
+                        "embedding": embedding,
                         "stream_worker": self
                     }
                     asyncio.run_coroutine_threadsafe(self.job_queue.put(job_data), self.loop)

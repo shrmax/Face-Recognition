@@ -59,7 +59,7 @@ async def enroll_uploads(uploads_dir: str = "./uploads"):
     logger.info(f"Scanning '{uploads_dir}' for profile enrollment (pending profiles: {len(pending_folders)})...")
     app = FaceAnalysis(
         name='buffalo_m',
-        providers=['CUDAExecutionProvider', 'CPUExecutionProvider'],
+        providers=['CUDAExecutionProvider', 'CoreMLExecutionProvider', 'CPUExecutionProvider'],
         allowed_modules=['detection', 'recognition']
     )
     app.prepare(ctx_id=0, det_size=(settings.DET_WIDTH, settings.DET_HEIGHT), det_thresh=settings.DET_THRESH)
