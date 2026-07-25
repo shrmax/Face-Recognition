@@ -316,7 +316,7 @@ async def get_stream_page(camera_id: str = "cam_1"):
                                     tracksList.innerHTML = data.tracks.map(t => `
                                         <div class="track-item">
                                             <span class="track-id">Head #${{t.track_id}}</span>
-                                            <span class="track-conf">Conf: ${(t.score * 100).toFixed(0)}%</span>
+                                            <span class="track-conf">Conf: ${{(t.score * 100).toFixed(0)}}%</span>
                                         </div>
                                     `).join('');
                                 }}
