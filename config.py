@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     SOCKET_MAX_HEIGHT: int = 720  # 720p max height for WebSocket streaming output
     
     # Quality & Blur Filtering
-    MIN_BLUR_VAR: float = 15.0   # Laplacian variance threshold
+    MIN_BLUR_VAR: float = 10.0   # Laplacian variance threshold (tuned for RTSP compressed video)
     MIN_FACE_SIZE: int = 12      # Min bounding box width/height in pixels for head detector
     MIN_FACE_CROP_SIZE: int = 15 # Min face crop width/height in pixels for quality filter
     

@@ -19,16 +19,18 @@ class FaceQualityFilter:
         if w < self.min_size or h < self.min_size:
             return False, 0.0, f"Crop size too small ({w}x{h} < {self.min_size}px)"
 
-        # Use INTER_AREA for downscaling, INTER_LINEAR for upscaling
-        interp = cv2.INTER_AREA if (w > 128 and h > 128) else cv2.INTER_LINEAR
-        resized = cv2.resize(crop_bgr, (128, 128), interpolation=interp)
+        # Downscale only if larger than 256x256 to save CPU, but never upscale to prevent artificial smoothing blur
+        if w > 256 or h > 256:
+            crop_eval = cv2.resize(crop_bgr, (256, 256), interpolation=cv2.INTER_AREA)
+        else:
+            crop_eval = crop_bgr
 
-        # Convert to grayscale for Laplacian blur variance calculation
-        gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+        # Convert to grayscale for native Laplacian blur variance calculation
+        gray = cv2.cvtColor(crop_eval, cv2.COLOR_BGR2GRAY)
         blur_score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
-        if blur_score < self.min_blur_var:
-            return False, blur_score, f"Blurry face crop (score {blur_score:.1f} < {self.min_blur_var:.1f})"
+        if blur_score < settings.MIN_BLUR_VAR:
+            return False, blur_score, f"Blurry face crop (score {blur_score:.1f} < {settings.MIN_BLUR_VAR:.1f})"
 
         return True, blur_score, "Passed"
 

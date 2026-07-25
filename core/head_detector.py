@@ -101,15 +101,31 @@ def _postprocess(
         if len(scores) == 0:
             return []
 
-        cx = boxes_raw[:, 0]
-        cy = boxes_raw[:, 1]
-        w = boxes_raw[:, 2]
-        h = boxes_raw[:, 3]
+        col_a, col_b, col_c, col_d = boxes_raw[:, 0], boxes_raw[:, 1], boxes_raw[:, 2], boxes_raw[:, 3]
+        is_xyxy = len(col_a) > 0 and np.mean((col_c > col_a) & (col_d > col_b)) > 0.8
+        logger.info(f"Raw box sample: {boxes_raw[0].tolist()}, is_xyxy={is_xyxy}")
 
-        x1 = (cx - w / 2.0 - float(pad_left)) / scale
-        y1 = (cy - h / 2.0 - float(pad_top)) / scale
-        x2 = (cx + w / 2.0 - float(pad_left)) / scale
-        y2 = (cy + h / 2.0 - float(pad_top)) / scale
+        if is_xyxy:
+            x1_m, y1_m, x2_m, y2_m = col_a, col_b, col_c, col_d
+        else:
+            x1_m = col_a - col_c / 2.0
+            y1_m = col_b - col_d / 2.0
+            x2_m = col_a + col_c / 2.0
+            y2_m = col_b + col_d / 2.0
+
+        x1 = (x1_m - float(pad_left)) / scale
+        y1 = (y1_m - float(pad_top)) / scale
+        x2 = (x2_m - float(pad_left)) / scale
+        y2 = (y2_m - float(pad_top)) / scale
+
+        # Aspect-ratio guard: filter out flat boxes (heads are taller than ~60% of their width)
+        bw = x2 - x1
+        bh = y2 - y1
+        valid_mask = (bh >= 0.6 * bw)
+
+        x1, y1, x2, y2, scores = x1[valid_mask], y1[valid_mask], x2[valid_mask], y2[valid_mask], scores[valid_mask]
+        if len(scores) == 0:
+            return []
 
         boxes_wh = np.stack([x1, y1, x2 - x1, y2 - y1], axis=1).tolist()
         indices = cv2.dnn.NMSBoxes(boxes_wh, scores.tolist(), conf_thresh, iou_thresh)
@@ -154,10 +170,30 @@ def _postprocess(
     if len(scores) == 0:
         return []
 
-    x1 = (boxes_raw[:, 0] - boxes_raw[:, 2] / 2.0 - float(pad_left)) / scale
-    y1 = (boxes_raw[:, 1] - boxes_raw[:, 3] / 2.0 - float(pad_top)) / scale
-    x2 = (boxes_raw[:, 0] + boxes_raw[:, 2] / 2.0 - float(pad_left)) / scale
-    y2 = (boxes_raw[:, 1] + boxes_raw[:, 3] / 2.0 - float(pad_top)) / scale
+    col_a, col_b, col_c, col_d = boxes_raw[:, 0], boxes_raw[:, 1], boxes_raw[:, 2], boxes_raw[:, 3]
+    is_xyxy = len(col_a) > 0 and np.mean((col_c > col_a) & (col_d > col_b)) > 0.8
+
+    if is_xyxy:
+        x1_m, y1_m, x2_m, y2_m = col_a, col_b, col_c, col_d
+    else:
+        x1_m = col_a - col_c / 2.0
+        y1_m = col_b - col_d / 2.0
+        x2_m = col_a + col_c / 2.0
+        y2_m = col_b + col_d / 2.0
+
+    x1 = (x1_m - float(pad_left)) / scale
+    y1 = (y1_m - float(pad_top)) / scale
+    x2 = (x2_m - float(pad_left)) / scale
+    y2 = (y2_m - float(pad_top)) / scale
+
+    # Aspect-ratio guard: filter out flat boxes
+    bw = x2 - x1
+    bh = y2 - y1
+    valid_mask = (bh >= 0.6 * bw)
+
+    x1, y1, x2, y2, scores = x1[valid_mask], y1[valid_mask], x2[valid_mask], y2[valid_mask], scores[valid_mask]
+    if len(scores) == 0:
+        return []
 
     boxes_wh = np.stack([x1, y1, x2 - x1, y2 - y1], axis=1).tolist()
     indices = cv2.dnn.NMSBoxes(boxes_wh, scores.tolist(), conf_thresh, iou_thresh)

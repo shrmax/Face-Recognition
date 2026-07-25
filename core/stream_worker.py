@@ -277,10 +277,18 @@ class StreamWorker:
                     if (now - last_job) >= job_interval:
                         self.track_manager.last_job_times[t_id] = now
                         bbox = detections.xyxy[idx].astype(int)
-                        x1, y1 = max(0, int(bbox[0])), max(0, int(bbox[1]))
-                        x2, y2 = min(w_img, int(bbox[2])), min(h_img, int(bbox[3]))
-                        if (x2 - x1) < settings.MIN_FACE_SIZE or (y2 - y1) < settings.MIN_FACE_SIZE:
+                        bx1, by1, bx2, by2 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+                        bw, bh = bx2 - bx1, by2 - by1
+                        if bw < settings.MIN_FACE_SIZE or bh < settings.MIN_FACE_SIZE:
                             continue
+                        
+                        # Add 35% margin padding for full facial feature context (hairline, ears, chin, neck)
+                        pad_w = int(bw * 0.35)
+                        pad_h = int(bh * 0.35)
+                        x1 = max(0, bx1 - pad_w)
+                        y1 = max(0, by1 - pad_h)
+                        x2 = min(w_img, bx2 + pad_w)
+                        y2 = min(h_img, by2 + pad_h)
                         
                         crop = frame[y1:y2, x1:x2].copy()
                         if crop.size == 0 or crop.shape[0] == 0 or crop.shape[1] == 0:

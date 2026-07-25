@@ -133,6 +133,16 @@ class RecognitionWorker:
         if self.detector is None:
             return
 
+        # Save debug head crops to disk for visual inspection
+        try:
+            debug_dir = os.path.join(settings.CROP_DIR, "debug_crops")
+            os.makedirs(debug_dir, exist_ok=True)
+            import cv2
+            import time
+            cv2.imwrite(os.path.join(debug_dir, f"track_{track_id}_{int(time.time()*1000)}.jpg"), head_crop)
+        except Exception as e:
+            logger.debug(f"Error saving debug crop: {e}")
+
         faces = self.detector.get(head_crop)
         logger.info(f"[{camera_id}] Track #{track_id} head_crop shape={head_crop.shape}, faces found={len(faces) if faces else 0}")
         if not faces:
@@ -145,12 +155,13 @@ class RecognitionWorker:
 
         is_passed, blur_score, reason = quality_filter.evaluate_quality(face_crop)
         if not is_passed:
-            logger.debug(f"[{camera_id}] Track #{track_id} face crop quality check failed: {reason}")
+            logger.info(f"[{camera_id}] Track #{track_id} face crop quality check rejected: {reason}")
             return  # stays PENDING, retries later when face becomes clear
 
         emb = face.embedding
         sim, best_profile_id = faiss_manager.search(emb)
         now = datetime.now(timezone.utc)
+        logger.info(f"[{camera_id}] Track #{track_id} FAISS match: best_profile='{best_profile_id}', sim={sim:.3f} (threshold={settings.HIGH_CONF_THRESH})")
 
         if sim >= settings.HIGH_CONF_THRESH:
             name = faiss_manager.get_name(best_profile_id)

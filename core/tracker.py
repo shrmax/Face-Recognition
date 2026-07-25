@@ -92,10 +92,9 @@ class StreamTrackManager:
         Updates ByteTrack with current frame's detected head bounding boxes.
         Returns:
             - sv.Detections object for annotation overlay
-            - List of pending jobs for unresolved tracks: [(track_id, (x1, y1, x2, y2))]
+            - Empty list (job dispatch is handled solely by stream_worker.py)
         """
         now = time.time()
-        job_interval = 1.0 / settings.SAMPLE_FPS
         h_img, w_img = frame_shape[:2]
 
         if not head_boxes:
@@ -125,8 +124,6 @@ class StreamTrackManager:
         )
 
         tracked_detections = self.byte_tracker.update_with_detections(detections)
-
-        pending_jobs = []
 
         if tracked_detections.tracker_id is not None:
             for idx, tracker_id in enumerate(tracked_detections.tracker_id):
@@ -161,13 +158,6 @@ class StreamTrackManager:
                             "timestamp": now
                         })
 
-                # Throttle recognition jobs per PENDING track to SAMPLE_FPS rate
-                if self.track_states[t_id] == TrackState.PENDING:
-                    last_job = self.last_job_times.get(t_id, 0.0)
-                    if (now - last_job) >= job_interval:
-                        self.last_job_times[t_id] = now
-                        pending_jobs.append((t_id, (x1, y1, x2, y2)))
-
         # Clean up stale track IDs
         active_ids = set(tracked_detections.tracker_id.tolist()) if tracked_detections.tracker_id is not None else set()
         stale_ids = [tid for tid in list(self.track_states.keys()) if tid not in active_ids]
@@ -177,7 +167,7 @@ class StreamTrackManager:
             self.track_low_conf_counts.pop(tid, None)
             self.last_job_times.pop(tid, None)
 
-        return tracked_detections, pending_jobs
+        return tracked_detections, []
 
     def set_track_identity(self, track_id: int, profile_id: str, label: str, is_new_visit: bool):
         """
