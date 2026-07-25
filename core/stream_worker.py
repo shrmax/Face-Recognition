@@ -34,7 +34,6 @@ class _CaptureThread(threading.Thread):
         self.connected = False
 
     def _open(self) -> cv2.VideoCapture:
-        # Set low-latency FFMPEG RTSP capture flags
         os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = (
             'rtsp_transport;tcp'
             '|fflags;nobuffer'
@@ -73,8 +72,7 @@ class _CaptureThread(threading.Thread):
 
             self.connected = True
             attempts = 0
-            
-            # Keep only the newest frame
+
             if self._q.full():
                 try:
                     self._q.get_nowait()
@@ -96,17 +94,17 @@ class _CaptureThread(threading.Thread):
 
 class StreamWorker:
     """
-    RTSP Stream Worker for high-performance head detection & ByteTrack tracking.
-    Concurrently streams structured JSON track metadata and JPEG frames over WebSockets.
+    RTSP Stream Worker combining high-throughput ONNX Head Detection, ByteTrack Tracking,
+    and asynchronous Face Recognition job dispatching.
     """
 
     def __init__(
         self,
         camera_id: str,
         rtsp_url: str,
-        job_queue: Optional[asyncio.Queue[dict[str, Union[str, int, np.ndarray, float]]]] = None,
+        job_queue: Optional[asyncio.Queue[dict[str, Union[str, int, np.ndarray, float, List[int], StreamWorker]]]] = None,
         loop: Optional[asyncio.AbstractEventLoop] = None,
-        on_tracks: Optional[Callable[[str, np.ndarray, List[dict[str, Union[int, float, Tuple[float, float, float, float]]]]], None]] = None,
+        on_tracks: Optional[Callable[[str, np.ndarray, List[dict[str, Union[int, float, str, Tuple[float, float, float, float]]]]], None]] = None,
         detector: Optional[HeadDetector] = None,
         tracker: Optional[HeadTracker] = None,
         pipeline_cfg: Optional[dict[str, Union[int, float]]] = None,
@@ -127,37 +125,48 @@ class StreamWorker:
         self._capture = _CaptureThread(rtsp_url, reconnect_delay, max_attempts)
 
         self._proc_thread: Optional[threading.Thread] = None
+        self._ai_thread: Optional[threading.Thread] = None
         self._stop_evt = threading.Event()
         self._frame_idx = 0
         self.current_fps: float = 0.0
 
-        self.latest_payload: Optional[dict[str, Union[str, int, float, List[dict[str, Union[int, float, Tuple[float, float, float, float]]]]]]] = None
+        self.last_raw_frame: Optional[np.ndarray] = None
+        self.active_tracks: List[dict[str, Union[int, float, str, Tuple[float, float, float, float]]]] = []
+        self.frame_lock = threading.Lock()
+
+        self.latest_payload: Optional[dict[str, Union[str, int, float, List[dict[str, Union[int, float, str, Tuple[float, float, float, float]]]]]]] = None
         self.latest_b64_frame: Optional[str] = None
         self.payload_lock = threading.Lock()
 
-        # Listeners for real-time WebSocket broadcast
-        self._socket_listeners: List[Callable[[dict[str, Union[str, int, float, List[dict[str, Union[int, float, Tuple[float, float, float, float]]]]]]], None]] = []
+        self.last_job_times: dict[int, float] = {}
 
-    def register_socket_listener(self, callback: Callable[[dict[str, Union[str, int, float, List[dict[str, Union[int, float, Tuple[float, float, float, float]]]]]]], None]) -> None:
+        self._socket_listeners: List[Callable[[dict[str, Union[str, int, float, List[dict[str, Union[int, float, str, Tuple[float, float, float, float]]]]]]], None]] = []
+
+    def register_socket_listener(self, callback: Callable[[dict[str, Union[str, int, float, List[dict[str, Union[int, float, str, Tuple[float, float, float, float]]]]]]], None]) -> None:
         if callback not in self._socket_listeners:
             self._socket_listeners.append(callback)
 
-    def unregister_socket_listener(self, callback: Callable[[dict[str, Union[str, int, float, List[dict[str, Union[int, float, Tuple[float, float, float, float]]]]]]], None]) -> None:
+    def unregister_socket_listener(self, callback: Callable[[dict[str, Union[str, int, float, List[dict[str, Union[int, float, str, Tuple[float, float, float, float]]]]]]], None]) -> None:
         if callback in self._socket_listeners:
             self._socket_listeners.remove(callback)
 
     def start(self) -> None:
         self._capture.start()
-        self._proc_thread = threading.Thread(target=self._run, daemon=True, name=f"StreamWorker_{self.camera_id}")
+
+        self._proc_thread = threading.Thread(target=self._run, daemon=True, name=f"Tracking_{self.camera_id}")
         self._proc_thread.start()
+
+        self._ai_thread = threading.Thread(target=self._ai_processing_loop, daemon=True, name=f"AI_{self.camera_id}")
+        self._ai_thread.start()
+
         logger.info("StreamWorker[%s] started for %s", self.camera_id, self.rtsp_url)
 
     def _run(self) -> None:
         detect_every_val = self.cfg.get("detect_every_n_frames", 3)
         detect_every = max(1, int(detect_every_val) if isinstance(detect_every_val, (int, float)) else 3)
-        
+
         last_time = time.time()
-        fps_alpha = 0.1  # Exponential moving average factor for FPS
+        fps_alpha = 0.1
 
         while not self._stop_evt.is_set():
             frame = self._capture.read(timeout=1.0)
@@ -170,9 +179,10 @@ class StreamWorker:
 
             if run_detector:
                 detections = self.detector.detect(frame)
-                tracks = self.tracker.update(detections)
+                head_boxes = [(d.bbox, d.score) for d in detections]
+                sv_dets, pending_jobs = self.track_manager.update(head_boxes, frame.shape)
             else:
-                tracks = self.tracker.update(None)  # Predict-only pass for skipped frames
+                sv_dets, pending_jobs = self.track_manager.update(None, frame.shape)
 
             dt = time.time() - last_time
             last_time = time.time()
@@ -180,17 +190,37 @@ class StreamWorker:
                 instant_fps = 1.0 / dt
                 self.current_fps = (1.0 - fps_alpha) * self.current_fps + fps_alpha * instant_fps
 
-            # Render annotations on bounding box canvas
-            rendered = frame.copy()
-            for trk in tracks:
-                x1, y1, x2, y2 = map(int, trk["bbox"])
-                tid = trk["track_id"]
-                score = trk["score"]
-                cv2.rectangle(rendered, (x1, y1), (x2, y2), (0, 255, 128), 2)
-                label = f"Head #{tid} ({score:.2f})"
-                cv2.putText(rendered, label, (x1, max(15, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 128), 2)
+            # Build enriched track dicts with resolved identity labels
+            enriched_tracks: List[dict[str, Union[int, float, str, Tuple[float, float, float, float]]]] = []
+            if sv_dets.tracker_id is not None and len(sv_dets.tracker_id) > 0:
+                for idx, tid in enumerate(sv_dets.tracker_id):
+                    tid_int = int(tid)
+                    box = sv_dets.xyxy[idx]
+                    conf = float(sv_dets.confidence[idx]) if sv_dets.confidence is not None else 0.0
+                    ident = self.track_manager.track_identities.get(tid_int, {})
+                    label_str = ident.get("label", f"Head #{tid_int}")
+                    status_str = ident.get("status", "pending")
 
-            # Resize output frame for WebSocket transport
+                    enriched_tracks.append({
+                        "track_id": tid_int,
+                        "bbox": (float(box[0]), float(box[1]), float(box[2]), float(box[3])),
+                        "score": conf,
+                        "label": label_str,
+                        "status": status_str
+                    })
+
+            with self.frame_lock:
+                self.last_raw_frame = frame.copy()
+                self.active_tracks = enriched_tracks
+
+            # Render bounding box overlay canvas
+            rendered = frame.copy()
+            for trk in enriched_tracks:
+                x1, y1, x2, y2 = map(int, trk["bbox"])
+                label_text = str(trk["label"])
+                cv2.rectangle(rendered, (x1, y1), (x2, y2), (0, 255, 128), 2)
+                cv2.putText(rendered, label_text, (x1, max(15, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 128), 2)
+
             if settings.SOCKET_MAX_WIDTH > 0 and settings.SOCKET_MAX_HEIGHT > 0:
                 h_f, w_f = rendered.shape[:2]
                 if w_f > settings.SOCKET_MAX_WIDTH or h_f > settings.SOCKET_MAX_HEIGHT:
@@ -200,14 +230,13 @@ class StreamWorker:
             _, jpeg_buf = cv2.imencode('.jpg', rendered, [cv2.IMWRITE_JPEG_QUALITY, 60])
             b64_frame = base64.b64encode(jpeg_buf).decode('utf-8')
 
-            # Standardized telemetry payload
             payload = {
                 "type": "frame",
                 "camera_id": self.camera_id,
                 "timestamp": round(time.time(), 3),
                 "frame_idx": self._frame_idx,
                 "fps": round(self.current_fps, 1),
-                "tracks": tracks,
+                "tracks": enriched_tracks,
                 "frame": b64_frame,
             }
 
@@ -217,7 +246,7 @@ class StreamWorker:
 
             if self.on_tracks is not None:
                 try:
-                    self.on_tracks(self.camera_id, frame, tracks)
+                    self.on_tracks(self.camera_id, frame, enriched_tracks)
                 except Exception as e:
                     logger.exception("on_tracks callback failed for camera %s: %s", self.camera_id, e)
 
@@ -227,13 +256,77 @@ class StreamWorker:
                 except Exception as e:
                     logger.error("Error pushing frame to socket listener: %s", e)
 
-            # Sleep briefly to avoid consuming 100% CPU on fast feeds
             elapsed = time.time() - t0
             target_period = 1.0 / max(1, settings.TRACKING_FPS)
             if elapsed < target_period:
                 time.sleep(target_period - elapsed)
 
-    def get_latest_payload(self) -> Optional[dict[str, Union[str, int, float, List[dict[str, Union[int, float, Tuple[float, float, float, float]]]]]]]:
+    def _ai_processing_loop(self) -> None:
+        """
+        Recognition job dispatch loop (~SAMPLE_FPS).
+        Dispatches head crops ONLY for active tracks in 'PENDING' state.
+        Once a track identity is RESOLVED, zero further recognition jobs are dispatched.
+        """
+        job_interval = 1.0 / max(1, settings.SAMPLE_FPS)
+        while not self._stop_evt.is_set():
+            time.sleep(job_interval)
+
+            if self.job_queue is None or self.loop is None:
+                continue
+
+            with self.frame_lock:
+                raw_frame = self.last_raw_frame.copy() if self.last_raw_frame is not None else None
+                tracks_to_check = list(self.active_tracks)
+
+            if raw_frame is None or len(tracks_to_check) == 0:
+                continue
+
+            h_img, w_img = raw_frame.shape[:2]
+            now = time.time()
+
+            for trk in tracks_to_check:
+                t_id = int(trk["track_id"])
+                state = self.track_manager.track_states.get(t_id)
+
+                # Skip resolved tracks completely — lock identity indefinitely
+                if state == "RESOLVED":
+                    continue
+
+                last_job = self.last_job_times.get(t_id, 0.0)
+                if (now - last_job) >= job_interval:
+                    self.last_job_times[t_id] = now
+                    x1, y1, x2, y2 = trk["bbox"]
+                    bx1, by1, bx2, by2 = int(x1), int(y1), int(x2), int(y2)
+                    bw, bh = bx2 - bx1, by2 - by1
+
+                    if bw < settings.MIN_FACE_SIZE or bh < settings.MIN_FACE_SIZE:
+                        continue
+
+                    # Add 35% margin padding around head box for facial context
+                    pad_w = int(bw * 0.35)
+                    pad_h = int(bh * 0.35)
+                    cx1 = max(0, bx1 - pad_w)
+                    cy1 = max(0, by1 - pad_h)
+                    cx2 = min(w_img, bx2 + pad_w)
+                    cy2 = min(h_img, by2 + pad_h)
+
+                    crop = raw_frame[cy1:cy2, cx1:cx2].copy()
+                    if crop.size == 0 or crop.shape[0] == 0 or crop.shape[1] == 0:
+                        continue
+
+                    job_data = {
+                        "camera_id": self.camera_id,
+                        "track_id": t_id,
+                        "crop": crop,
+                        "bbox": [cx1, cy1, cx2, cy2],
+                        "stream_worker": self
+                    }
+                    try:
+                        asyncio.run_coroutine_threadsafe(self.job_queue.put(job_data), self.loop)
+                    except Exception as err:
+                        logger.error("[%s] Error enqueueing recognition job for Track #%d: %s", self.camera_id, t_id, err)
+
+    def get_latest_payload(self) -> Optional[dict[str, Union[str, int, float, List[dict[str, Union[int, float, str, Tuple[float, float, float, float]]]]]]]:
         with self.payload_lock:
             return self.latest_payload
 
@@ -246,4 +339,6 @@ class StreamWorker:
         self._capture.stop()
         if self._proc_thread and self._proc_thread.is_alive():
             self._proc_thread.join(timeout=2.0)
+        if self._ai_thread and self._ai_thread.is_alive():
+            self._ai_thread.join(timeout=2.0)
         logger.info("StreamWorker[%s] stopped", self.camera_id)

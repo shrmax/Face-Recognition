@@ -16,7 +16,7 @@ from database.mongo import mongo_db
 from database.storage import crop_storage
 from core.stream_worker import StreamWorker
 from core.head_detector import get_global_head_detector
-from core.recognition import faiss_manager, RecognitionWorker
+from core.recognition import faiss_manager, RecognitionWorker, get_face_detector
 
 # Configure Logging
 logging.basicConfig(
@@ -25,16 +25,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main_service")
 
-# Global Stream Registry
+# Global Stream & Worker Registry
 active_streams: Dict[str, StreamWorker] = {}
-recognition_job_queue: Optional[asyncio.Queue[dict[str, Union[str, int, np.ndarray, float]]]] = None
+recognition_job_queue: Optional[asyncio.Queue[dict[str, Union[str, int, np.ndarray, float, List[int], StreamWorker]]]] = None
 recognition_worker: Optional[RecognitionWorker] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global recognition_job_queue, recognition_worker
-    logger.info("Initializing Real-Time CCTV Head Detection & Tracking Service...")
+    logger.info("Initializing Real-Time CCTV Head Detection & Face Recognition Service...")
 
     # 1. Connect MongoDB
     try:
@@ -42,16 +42,42 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("MongoDB connection skipped/warning: %s", e)
 
-    # 2. Pre-load ONNX Head Detector session
+    # 2. Sync uploads folder & initialize FAISS Vector Index
+    if os.path.exists("./uploads"):
+        try:
+            from scripts.enroll_uploads import enroll_uploads
+            await enroll_uploads("./uploads")
+        except Exception as e:
+            logger.error("Error syncing uploads folder: %s", e)
+
+    faiss_manager.initialize()
+    if not faiss_manager.load_from_disk():
+        try:
+            db_profiles = await mongo_db.load_all_profiles()
+            for p in db_profiles:
+                pid = str(p.get("profile_id", ""))
+                name = str(p.get("name", pid))
+                embeddings = p.get("embeddings")
+                if isinstance(embeddings, list):
+                    for vec in embeddings:
+                        faiss_manager.add_vector(np.array(vec, dtype=np.float32), pid, name)
+            faiss_manager.save_to_disk()
+        except Exception as e:
+            logger.warning("Could not load profiles from MongoDB into FAISS: %s", e)
+
+    # 3. Pre-load ONNX Head Detector session & InsightFace detector
     get_global_head_detector()
+    face_app = get_face_detector()
 
-    # 3. Create Async Job Queue & Start Recognition Workers
+    # 4. Create Async Job Queue & Start Recognition Workers
     recognition_job_queue = asyncio.Queue(maxsize=100)
+    recognition_worker = RecognitionWorker(recognition_job_queue, face_app)
+    await recognition_worker.start_worker_pool(num_workers=2)
 
-    # 4. Schedule daily retention cleanup task
+    # 5. Schedule daily retention cleanup task
     asyncio.create_task(periodic_retention_cleanup())
 
-    # 5. Auto-start RTSP streams configured in settings / .env
+    # 6. Auto-start RTSP streams configured in settings / .env
     if settings.RTSP_STREAMS.strip():
         loop = asyncio.get_event_loop()
         for idx, rtsp_url in enumerate(settings.RTSP_STREAMS.split(","), start=1):
@@ -70,13 +96,17 @@ async def lifespan(app: FastAPI):
 
     # Shutdown logic
     logger.info("Shutting down service...")
+    if recognition_worker is not None:
+        recognition_worker.running = False
+
     for cam_id, worker in list(active_streams.items()):
         worker.stop()
+
     await mongo_db.close()
     logger.info("Shutdown complete.")
 
 
-app = FastAPI(title="Real-Time Head Detection & ByteTrack Streaming Service", lifespan=lifespan)
+app = FastAPI(title="Real-Time Head Detection & Face Recognition Service", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -109,7 +139,7 @@ async def get_stream_page(camera_id: str = "cam_1"):
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Real-Time CCTV Head Detection & Tracking - {camera_id}</title>
+        <title>Real-Time CCTV Head Detection & Face Recognition - {camera_id}</title>
         <style>
             * {{ box-sizing: border-box; margin: 0; padding: 0; }}
             body {{
@@ -240,12 +270,12 @@ async def get_stream_page(camera_id: str = "cam_1"):
                 border: 1px solid #1e293b;
             }}
             .track-id {{ font-weight: 600; color: #38bdf8; }}
-            .track-conf {{ color: #10b981; font-weight: 500; }}
+            .track-status {{ color: #10b981; font-weight: 500; }}
         </style>
     </head>
     <body>
         <div class="header">
-            <h1>🎥 Real-Time CCTV Head Detection & Tracking</h1>
+            <h1>🎥 Real-Time CCTV Head Detection & Face Recognition</h1>
             <div class="subtitle">Stream Camera ID: <strong>{camera_id}</strong></div>
         </div>
 
@@ -271,9 +301,9 @@ async def get_stream_page(camera_id: str = "cam_1"):
                     </div>
                 </div>
 
-                <h4 style="font-size: 0.9rem; color: #94a3b8; margin-top: 8px;">Active Head Bounding Boxes</h4>
+                <h4 style="font-size: 0.9rem; color: #94a3b8; margin-top: 8px;">Active Head Identities</h4>
                 <div class="tracks-container" id="tracksList">
-                    <div style="color: #64748b; font-size: 0.85rem;">Waiting for tracking data...</div>
+                    <div style="color: #64748b; font-size: 0.85rem;">Waiting for tracking & identity data...</div>
                 </div>
             </div>
         </div>
@@ -315,8 +345,8 @@ async def get_stream_page(camera_id: str = "cam_1"):
                                 }} else {{
                                     tracksList.innerHTML = data.tracks.map(t => `
                                         <div class="track-item">
-                                            <span class="track-id">Head #${{t.track_id}}</span>
-                                            <span class="track-conf">Conf: ${{(t.score * 100).toFixed(0)}}%</span>
+                                            <span class="track-id">${{t.label || ('Head #' + t.track_id)}}</span>
+                                            <span class="track-status">${{t.status === 'resolved' ? 'LOCKED' : 'PENDING'}}</span>
                                         </div>
                                     `).join('');
                                 }}
@@ -353,6 +383,7 @@ async def health_check():
         "status": "ok",
         "active_streams": len(active_streams),
         "stream_ids": list(active_streams.keys()),
+        "faiss_vectors": len(faiss_manager.faiss_ids) if faiss_manager.index else 0,
         "queue_size": recognition_job_queue.qsize() if recognition_job_queue else 0,
         "mongo_connected": mongo_db.db is not None
     }
