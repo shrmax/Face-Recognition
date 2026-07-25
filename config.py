@@ -116,6 +116,7 @@ class Settings(BaseSettings):
     HIGH_CONF_THRESH: float = 0.60  # High-accuracy similarity match threshold
     LOW_CONF_THRESH: float = 0.32
     MAX_EVAL_ATTEMPTS: int = 8      # Maximum clear evaluation attempts before locking Unknown
+    DEDUP_SIM_THRESH: float = 0.95  # Vector similarity threshold to prune duplicate photos during enrollment
     MAX_GALLERY_EMBEDDINGS: int = 5
 
     # Cooldown & Retention Policy
