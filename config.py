@@ -1,5 +1,5 @@
 import os
-from typing import List, Tuple, TYPE_CHECKING
+from typing import List, Tuple, Union, TYPE_CHECKING
 import onnxruntime as ort
 
 if TYPE_CHECKING:
@@ -93,13 +93,13 @@ class Settings(BaseSettings):
     HEAD_DET_SIZE: int = 640
     HEAD_DET_CONF: float = 0.35
     HEAD_DET_IOU: float = 0.45
-    DET_WIDTH: int = 1280
-    DET_HEIGHT: int = 1280
-    DET_THRESH: float = 0.20
+    DET_WIDTH: int = 640   # Optimized SCRFD detection width for fast head crop processing
+    DET_HEIGHT: int = 640  # Optimized SCRFD detection height for fast head crop processing
+    DET_THRESH: float = 0.20  # High-precision SCRFD face detection threshold
     MAX_FACES: int = 0  # 0 = unlimited
 
     # Sampling & Performance
-    SAMPLE_FPS: int = 12  # AI Recognition Job Dispatch FPS
+    SAMPLE_FPS: int = 4   # Optimized sampling interval (1 crop every 250ms gives time for frontal pose)
     TRACKING_FPS: int = 25 # Head Detection & ByteTrack Update FPS
     WATCHDOG_TIMEOUT_SECONDS: float = 5.0
     REVERIFY_INTERVAL_SECONDS: float = 45.0
@@ -107,13 +107,15 @@ class Settings(BaseSettings):
     SOCKET_MAX_HEIGHT: int = 720
 
     # Quality & Blur Filtering
-    MIN_BLUR_VAR: float = 10.0
-    MIN_FACE_SIZE: int = 12
-    MIN_FACE_CROP_SIZE: int = 15
+    MIN_BLUR_VAR: float = 35.0   # Strict zero-blur check (discards all blurry/defocused crops below 35.0)
+    MIN_DET_SCORE: float = 0.50  # High confidence SCRFD threshold (requires clear full face)
+    MIN_FACE_SIZE: int = 16
+    MIN_FACE_CROP_SIZE: int = 24 # Minimum face resolution (24x24px) for reliable ArcFace 512D embedding
 
     # FAISS Dual Thresholds & Multi-Vector Gallery
-    HIGH_CONF_THRESH: float = 0.42
-    LOW_CONF_THRESH: float = 0.28
+    HIGH_CONF_THRESH: float = 0.45  # High-accuracy similarity match threshold
+    LOW_CONF_THRESH: float = 0.32
+    MAX_EVAL_ATTEMPTS: int = 8      # Maximum clear evaluation attempts before locking Unknown
     MAX_GALLERY_EMBEDDINGS: int = 5
 
     # Cooldown & Retention Policy
@@ -124,9 +126,9 @@ class Settings(BaseSettings):
     RTSP_STREAMS: str = ""
 
     # Pipeline & Models exposure
-    HEAD_DETECTOR_CFG: dict[str, object] = HEAD_DETECTOR
-    TRACKER_CFG: dict[str, object] = TRACKER
-    PIPELINE_CFG: dict[str, object] = PIPELINE
+    HEAD_DETECTOR_CFG: dict[str, Union[int, float, str, list[str], tuple[int, int]]] = HEAD_DETECTOR
+    TRACKER_CFG: dict[str, Union[float, int]] = TRACKER
+    PIPELINE_CFG: dict[str, Union[int, float]] = PIPELINE
 
     class Config:
         env_file = ".env"

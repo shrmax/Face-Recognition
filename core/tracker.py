@@ -218,6 +218,7 @@ class StreamTrackManager:
         self.head_tracker = HeadTracker()
         self.track_states: dict[int, str] = {}
         self.track_identities: dict[int, dict[str, str]] = {}
+        self.track_low_conf_counts: dict[int, int] = {}
         self.spatial_memory: List[dict[str, Union[str, float, List[int]]]] = []
         
         self.box_annotator = sv.BoxAnnotator(thickness=2, color_lookup=sv.ColorLookup.INDEX)
@@ -290,6 +291,7 @@ class StreamTrackManager:
         for tid in stale_ids:
             self.track_states.pop(tid, None)
             self.track_identities.pop(tid, None)
+            self.track_low_conf_counts.pop(tid, None)
             self.track_last_seen.pop(tid, None)
 
         return sv_dets, pending_jobs

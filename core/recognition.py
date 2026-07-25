@@ -137,16 +137,18 @@ class RecognitionWorker:
             asyncio.create_task(self._worker_loop(i))
 
     async def _worker_loop(self, worker_id: int) -> None:
+        loop = asyncio.get_running_loop()
         while self.running:
             try:
                 job = await self.job_queue.get()
-                await self._process_job(job)
+                # Execute heavy CPU ONNX model inference off the main asyncio thread loop!
+                await loop.run_in_executor(None, self._process_job_sync, job)
                 self.job_queue.task_done()
             except Exception as e:
                 logger.error("Error in recognition worker %d: %s", worker_id, e)
                 await asyncio.sleep(0.05)
 
-    async def _process_job(self, job: JobData) -> None:
+    def _process_job_sync(self, job: JobData) -> None:
         camera_id = job["camera_id"]
         track_id = job["track_id"]
         head_crop = job["crop"]
@@ -169,6 +171,42 @@ class RecognitionWorker:
             return  # Face not clearly visible yet — stays PENDING, retries next cycle
 
         face = max(faces, key=lambda f: float(getattr(f, 'det_score', 0.0)))
+        det_score = float(getattr(face, 'det_score', 0.0))
+
+        if det_score < settings.MIN_DET_SCORE:
+            logger.debug("[%s] Track #%d face det_score too low (%.2f < %.2f), skipping",
+                         camera_id, track_id, det_score, settings.MIN_DET_SCORE)
+            return  # Face turned away/back of head — stays PENDING, retries when face turns toward camera
+
+        # Validate full frontal face landmark geometry (requires 5 keypoints: eyes, nose, mouth)
+        kps = getattr(face, 'kps', None)
+        if kps is None or len(kps) < 5:
+            logger.debug("[%s] Track #%d face missing full keypoints, skipping", camera_id, track_id)
+            return
+
+        left_eye, right_eye, nose, left_mouth, right_mouth = kps[:5]
+        eye_dist = float(np.linalg.norm(left_eye - right_eye))
+        
+        # 1. Eye Distance Check (at least 12px for full face resolution)
+        if eye_dist < 12.0:
+            logger.debug("[%s] Track #%d eye distance too small (%.1fpx < 12.0px), skipping", camera_id, track_id, eye_dist)
+            return
+
+        # 2. Vertical Landmark Alignment Check (eyes above nose, nose above mouth)
+        eye_center_y = (left_eye[1] + right_eye[1]) / 2.0
+        mouth_center_y = (left_mouth[1] + right_mouth[1]) / 2.0
+        if not (eye_center_y < nose[1] < mouth_center_y):
+            logger.debug("[%s] Track #%d vertical landmark misalignment (tilted/profile face), skipping", camera_id, track_id)
+            return
+
+        # 3. Horizontal Pose Symmetry Check (Nose centered relative to eyes, max 0.45 offset)
+        eye_center_x = (left_eye[0] + right_eye[0]) / 2.0
+        eye_span_x = abs(right_eye[0] - left_eye[0]) + 1e-5
+        nose_offset_x = abs(nose[0] - eye_center_x) / eye_span_x
+        if nose_offset_x > 0.45:
+            logger.debug("[%s] Track #%d side-profile pose rejected (nose_offset=%.2f > 0.45), skipping", camera_id, track_id, nose_offset_x)
+            return
+
         fx1, fy1, fx2, fy2 = face.bbox.astype(int)
         fx1, fy1 = max(0, fx1), max(0, fy1)
         face_crop = head_crop[fy1:fy2, fx1:fx2]
@@ -189,7 +227,7 @@ class RecognitionWorker:
             label = f"#{track_id} {name} ({sim:.2f})"
             stream_worker.track_manager.set_track_identity(track_id, best_profile_id, label, is_new_visit=True)
 
-            # Persist crop and detection log in MongoDB
+            # Save face crop
             crop_file_path = crop_storage.save_crop(face_crop, best_profile_id, track_id)
             event_doc = {
                 "camera_id": camera_id,
@@ -202,12 +240,17 @@ class RecognitionWorker:
                 "crop_path": crop_file_path,
                 "review_required": False
             }
-            await mongo_db.save_detection_event(event_doc)
+            if stream_worker.loop and stream_worker.loop.is_running():
+                asyncio.run_coroutine_threadsafe(mongo_db.save_detection_event(event_doc), stream_worker.loop)
 
             # Progressive vector gallery addition for moderate confidence matches
             if settings.HIGH_CONF_THRESH <= sim < 0.85:
                 faiss_manager.add_vector(emb, best_profile_id, name)
-                await mongo_db.save_or_update_profile(best_profile_id, emb.tolist(), name)
+                if stream_worker.loop and stream_worker.loop.is_running():
+                    asyncio.run_coroutine_threadsafe(
+                        mongo_db.save_or_update_profile(best_profile_id, emb.tolist(), name),
+                        stream_worker.loop
+                    )
                 faiss_manager.save_to_disk()
 
             logger.info("[%s] KNOWN IDENTITY RESOLVED: Track #%d -> %s (sim=%.2f)", camera_id, track_id, name, sim)
@@ -218,8 +261,8 @@ class RecognitionWorker:
         current_low_count = manager.track_low_conf_counts.get(track_id, 0) + 1
         manager.track_low_conf_counts[track_id] = current_low_count
 
-        if current_low_count >= 5:
-            # Resolve as Unknown after 5 clear quality evaluations fail to match known profiles
+        if current_low_count >= settings.MAX_EVAL_ATTEMPTS:
+            # Resolve as Unknown after MAX_EVAL_ATTEMPTS clear quality evaluations fail to match known profiles
             label = f"#{track_id} Unknown"
             manager.set_track_identity(track_id, "Unknown", label, is_new_visit=False)
             logger.info("[%s] Track #%d RESOLVED as Unknown after %d evaluations", camera_id, track_id, current_low_count)
