@@ -113,7 +113,7 @@ class Settings(BaseSettings):
     MIN_FACE_CROP_SIZE: int = 24 # Minimum face resolution (24x24px) for reliable ArcFace 512D embedding
 
     # FAISS Dual Thresholds & Multi-Vector Gallery
-    HIGH_CONF_THRESH: float = 0.45  # High-accuracy similarity match threshold
+    HIGH_CONF_THRESH: float = 0.60  # High-accuracy similarity match threshold
     LOW_CONF_THRESH: float = 0.32
     MAX_EVAL_ATTEMPTS: int = 8      # Maximum clear evaluation attempts before locking Unknown
     MAX_GALLERY_EMBEDDINGS: int = 5

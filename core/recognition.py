@@ -243,16 +243,6 @@ class RecognitionWorker:
             if stream_worker.loop and stream_worker.loop.is_running():
                 asyncio.run_coroutine_threadsafe(mongo_db.save_detection_event(event_doc), stream_worker.loop)
 
-            # Progressive vector gallery addition for moderate confidence matches
-            if settings.HIGH_CONF_THRESH <= sim < 0.85:
-                faiss_manager.add_vector(emb, best_profile_id, name)
-                if stream_worker.loop and stream_worker.loop.is_running():
-                    asyncio.run_coroutine_threadsafe(
-                        mongo_db.save_or_update_profile(best_profile_id, emb.tolist(), name),
-                        stream_worker.loop
-                    )
-                faiss_manager.save_to_disk()
-
             logger.info("[%s] KNOWN IDENTITY RESOLVED: Track #%d -> %s (sim=%.2f)", camera_id, track_id, name, sim)
             return
 

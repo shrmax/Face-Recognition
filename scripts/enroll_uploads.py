@@ -111,7 +111,7 @@ async def enroll_uploads(uploads_dir: str = "./uploads"):
             doc = {
                 'profile_id': profile_id,
                 'name': display_name,
-                'embeddings': embeddings[:settings.MAX_GALLERY_EMBEDDINGS],
+                'embeddings': embeddings,
                 'sample_count': len(embeddings),
                 'img_count': len(img_files),
                 'status': 'active'
