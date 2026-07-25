@@ -6,10 +6,11 @@ import asyncio
 import logging
 import threading
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple, Optional, TypedDict, TYPE_CHECKING
+from typing import Dict, List, Tuple, Optional, TypedDict, Union, TYPE_CHECKING
 from config import settings
 from database.mongo import mongo_db
 from database.storage import crop_storage
+from core.quality import quality_filter
 from insightface.app import FaceAnalysis
 
 if TYPE_CHECKING:
@@ -20,32 +21,56 @@ class JobData(TypedDict):
     track_id: int
     crop: np.ndarray
     bbox: List[int]
-    embedding: np.ndarray
     stream_worker: 'StreamWorker'
 
 logger = logging.getLogger("recognition")
 
+_face_detector_instance: Optional[FaceAnalysis] = None
+_face_detector_lock = threading.Lock()
+
+
+def get_face_detector() -> FaceAnalysis:
+    """Returns singleton InsightFace FaceAnalysis instance for face detection & embedding extraction."""
+    global _face_detector_instance
+    if _face_detector_instance is None:
+        with _face_detector_lock:
+            if _face_detector_instance is None:
+                app = FaceAnalysis(
+                    name='buffalo_m',
+                    providers=['CUDAExecutionProvider', 'CoreMLExecutionProvider', 'CPUExecutionProvider'],
+                    allowed_modules=['detection', 'recognition']
+                )
+                app.prepare(
+                    ctx_id=0,
+                    det_size=(settings.DET_WIDTH, settings.DET_HEIGHT),
+                    det_thresh=settings.DET_THRESH
+                )
+                _face_detector_instance = app
+                logger.info("InsightFace detector initialized with det_size=(%d,%d)", settings.DET_WIDTH, settings.DET_HEIGHT)
+    return _face_detector_instance
+
+
 class FAISSIndexManager:
-    def __init__(self):
+    def __init__(self) -> None:
         self.dimension = 512
         self.index: Optional[faiss.Index] = None
         self.faiss_ids: List[str] = []
         self.profile_names: Dict[str, str] = {}
         self.lock = threading.Lock()
 
-    def initialize(self):
+    def initialize(self) -> None:
         with self.lock:
             self.index = faiss.IndexFlatIP(self.dimension)
             self.faiss_ids = []
             self.profile_names = {}
 
-    def add_vector(self, embedding: np.ndarray, profile_id: str, name: Optional[str] = None):
-        """Adds a single normalized vector to FAISS index"""
+    def add_vector(self, embedding: np.ndarray, profile_id: str, name: Optional[str] = None) -> None:
+        """Adds a single normalized vector to FAISS index."""
         with self.lock:
             if self.index is None:
                 self.index = faiss.IndexFlatIP(self.dimension)
-            norm_vector = embedding / np.linalg.norm(embedding)
-            self.index.add(norm_vector.reshape(1, -1))
+            norm_vector = embedding / (np.linalg.norm(embedding) + 1e-6)
+            self.index.add(norm_vector.reshape(1, -1).astype(np.float32))
             self.faiss_ids.append(profile_id)
             if name:
                 self.profile_names[profile_id] = name
@@ -55,29 +80,29 @@ class FAISSIndexManager:
             return self.profile_names.get(profile_id, profile_id)
 
     def search(self, query_embedding: np.ndarray) -> Tuple[float, str]:
-        """Searches query vector against FAISS index. Returns (similarity, profile_id)"""
+        """Searches query vector against FAISS index. Returns (similarity, profile_id)."""
         with self.lock:
             if self.index is None or self.index.ntotal == 0 or not self.faiss_ids:
                 return 0.0, "Unknown"
-            
-            qnorm = query_embedding / np.linalg.norm(query_embedding)
-            distances, indices = self.index.search(qnorm.reshape(1, -1), k=1)
-            
+
+            qnorm = query_embedding / (np.linalg.norm(query_embedding) + 1e-6)
+            distances, indices = self.index.search(qnorm.reshape(1, -1).astype(np.float32), k=1)
+
             best_sim = float(distances[0][0])
-            best_idx = indices[0][0]
-            
-            if best_idx >= 0 and best_idx < len(self.faiss_ids):
+            best_idx = int(indices[0][0])
+
+            if 0 <= best_idx < len(self.faiss_ids):
                 return best_sim, self.faiss_ids[best_idx]
             return 0.0, "Unknown"
 
-    def save_to_disk(self):
+    def save_to_disk(self) -> None:
         with self.lock:
             if self.index is not None:
                 faiss.write_index(self.index, settings.FAISS_INDEX_PATH)
                 with open(settings.KNOWN_IDS_PATH, 'wb') as f:
                     pickle.dump({"ids": self.faiss_ids, "names": self.profile_names}, f)
 
-    def load_from_disk(self):
+    def load_from_disk(self) -> bool:
         with self.lock:
             if os.path.exists(settings.FAISS_INDEX_PATH) and os.path.exists(settings.KNOWN_IDS_PATH):
                 try:
@@ -90,147 +115,144 @@ class FAISSIndexManager:
                         else:
                             self.faiss_ids = data
                             self.profile_names = {}
-                    logger.info(f"Loaded FAISS index from disk ({len(self.faiss_ids)} total vectors).")
+                    logger.info("Loaded FAISS index from disk (%d total vectors).", len(self.faiss_ids))
                     return True
                 except Exception as e:
-                    logger.error(f"Failed to load FAISS from disk: {e}")
+                    logger.error("Failed to load FAISS from disk: %s", e)
             return False
+
 
 faiss_manager = FAISSIndexManager()
 
-class RecognitionWorker:
-    def __init__(self, job_queue: asyncio.Queue, app_detector: Optional[FaceAnalysis] = None):
-        self.job_queue = job_queue
-        self.detector = app_detector
-        self.running = True
-        self.counter = 1000
 
-    async def start_worker_pool(self, num_workers: int = 2):
-        logger.info(f"Starting {num_workers} async recognition worker tasks...")
+class RecognitionWorker:
+    def __init__(self, job_queue: asyncio.Queue[JobData], app_detector: Optional[FaceAnalysis] = None) -> None:
+        self.job_queue = job_queue
+        self.detector = app_detector or get_face_detector()
+        self.running = True
+
+    async def start_worker_pool(self, num_workers: int = 2) -> None:
+        logger.info("Starting %d async face recognition worker tasks...", num_workers)
         for i in range(num_workers):
             asyncio.create_task(self._worker_loop(i))
 
-    async def _worker_loop(self, worker_id: int):
+    async def _worker_loop(self, worker_id: int) -> None:
+        loop = asyncio.get_running_loop()
         while self.running:
             try:
                 job = await self.job_queue.get()
-                await self._process_job(job)
+                # Execute heavy CPU ONNX model inference off the main asyncio thread loop!
+                await loop.run_in_executor(None, self._process_job_sync, job)
                 self.job_queue.task_done()
             except Exception as e:
-                logger.error(f"Error in recognition worker {worker_id}: {e}")
+                logger.error("Error in recognition worker %d: %s", worker_id, e)
                 await asyncio.sleep(0.05)
 
-    async def _process_job(self, job: JobData):
+    def _process_job_sync(self, job: JobData) -> None:
         camera_id = job["camera_id"]
         track_id = job["track_id"]
-        crop = job["crop"]
+        head_crop = job["crop"]
         bbox = job["bbox"]
         stream_worker = job["stream_worker"]
-        raw_emb = job.get("embedding")
 
-        if raw_emb is None:
+        if head_crop is None or head_crop.size == 0 or head_crop.shape[0] == 0 or head_crop.shape[1] == 0:
             return
 
-        emb = np.array(raw_emb, dtype=np.float32)
-        sim, best_profile_id = faiss_manager.search(emb)
+        if self.detector is None:
+            return
 
+        try:
+            faces = self.detector.get(head_crop)
+        except Exception as e:
+            logger.error("[%s] InsightFace analysis error on track #%d: %s", camera_id, track_id, e)
+            return
+
+        if not faces:
+            return  # Face not clearly visible yet — stays PENDING, retries next cycle
+
+        face = max(faces, key=lambda f: float(getattr(f, 'det_score', 0.0)))
+        det_score = float(getattr(face, 'det_score', 0.0))
+
+        if det_score < settings.MIN_DET_SCORE:
+            logger.debug("[%s] Track #%d face det_score too low (%.2f < %.2f), skipping",
+                         camera_id, track_id, det_score, settings.MIN_DET_SCORE)
+            return  # Face turned away/back of head — stays PENDING, retries when face turns toward camera
+
+        # Validate full frontal face landmark geometry (requires 5 keypoints: eyes, nose, mouth)
+        kps = getattr(face, 'kps', None)
+        if kps is None or len(kps) < 5:
+            logger.debug("[%s] Track #%d face missing full keypoints, skipping", camera_id, track_id)
+            return
+
+        left_eye, right_eye, nose, left_mouth, right_mouth = kps[:5]
+        eye_dist = float(np.linalg.norm(left_eye - right_eye))
+        
+        # 1. Eye Distance Check (at least 12px for full face resolution)
+        if eye_dist < 12.0:
+            logger.debug("[%s] Track #%d eye distance too small (%.1fpx < 12.0px), skipping", camera_id, track_id, eye_dist)
+            return
+
+        # 2. Vertical Landmark Alignment Check (eyes above nose, nose above mouth)
+        eye_center_y = (left_eye[1] + right_eye[1]) / 2.0
+        mouth_center_y = (left_mouth[1] + right_mouth[1]) / 2.0
+        if not (eye_center_y < nose[1] < mouth_center_y):
+            logger.debug("[%s] Track #%d vertical landmark misalignment (tilted/profile face), skipping", camera_id, track_id)
+            return
+
+        # 3. Horizontal Pose Symmetry Check (Nose centered relative to eyes, max 0.45 offset)
+        eye_center_x = (left_eye[0] + right_eye[0]) / 2.0
+        eye_span_x = abs(right_eye[0] - left_eye[0]) + 1e-5
+        nose_offset_x = abs(nose[0] - eye_center_x) / eye_span_x
+        if nose_offset_x > 0.45:
+            logger.debug("[%s] Track #%d side-profile pose rejected (nose_offset=%.2f > 0.45), skipping", camera_id, track_id, nose_offset_x)
+            return
+
+        fx1, fy1, fx2, fy2 = face.bbox.astype(int)
+        fx1, fy1 = max(0, fx1), max(0, fy1)
+        face_crop = head_crop[fy1:fy2, fx1:fx2]
+
+        is_passed, blur_score, reason = quality_filter.evaluate_quality(face_crop)
+        if not is_passed:
+            logger.debug("[%s] Track #%d face quality rejected: %s", camera_id, track_id, reason)
+            return  # stays PENDING, retries next cycle when posture improves
+
+        emb = face.embedding
+        sim, best_profile_id = faiss_manager.search(emb)
         now = datetime.now(timezone.utc)
-        crop_file_path = crop_storage.save_crop(crop, best_profile_id, track_id)
+        logger.info("[%s] Track #%d FAISS match: profile='%s', sim=%.3f (thresh=%.2f)",
+                    camera_id, track_id, best_profile_id, sim, settings.HIGH_CONF_THRESH)
 
         if sim >= settings.HIGH_CONF_THRESH:
-            # Clear low confidence count for high confidence match
-            stream_worker.track_manager.track_low_conf_counts.pop(track_id, None)
-            
-            # Match Known Profile
-            in_cooldown = stream_worker.track_manager.check_visit_cooldown(best_profile_id)
             name = faiss_manager.get_name(best_profile_id)
             label = f"#{track_id} {name} ({sim:.2f})"
-            stream_worker.track_manager.set_track_identity(track_id, best_profile_id, label, is_new_visit=not in_cooldown)
+            stream_worker.track_manager.set_track_identity(track_id, best_profile_id, label, is_new_visit=True)
 
-            # Progressive Learning: If sim is between 0.55 and 0.85, add vector to multi-vector gallery
-            if settings.HIGH_CONF_THRESH <= sim < 0.85:
-                faiss_manager.add_vector(emb, best_profile_id, name)
-                await mongo_db.save_or_update_profile(best_profile_id, emb.tolist(), name)
-
-            if not in_cooldown:
-                event_doc = {
-                    "camera_id": str(camera_id),
-                    "track_id": int(track_id),
-                    "profile_id": str(best_profile_id),
-                    "confidence": float(sim),
-                    "event_type": "KNOWN_IDENTITY",
-                    "timestamp": now,
-                    "bbox": [int(x) for x in bbox],
-                    "crop_path": str(crop_file_path),
-                    "review_required": False
-                }
-                await mongo_db.save_detection_event(event_doc)
-                logger.info(f"[{camera_id}] KNOWN_IDENTITY Logged: Track #{track_id} {name} ({sim:.2f})")
-
-        elif settings.LOW_CONF_THRESH <= sim < settings.HIGH_CONF_THRESH:
-            # Clear low confidence count for candidate match
-            stream_worker.track_manager.track_low_conf_counts.pop(track_id, None)
-
-            # Uncertain / Review Candidate
-            name = faiss_manager.get_name(best_profile_id)
-            label = f"#{track_id} {name}? ({sim:.2f})"
-            stream_worker.track_manager.set_track_identity(track_id, "Review_Required", label, is_new_visit=True)
-
+            # Save face crop
+            crop_file_path = crop_storage.save_crop(face_crop, best_profile_id, track_id)
             event_doc = {
-                "camera_id": str(camera_id),
-                "track_id": int(track_id),
-                "profile_id": str(best_profile_id),
-                "confidence": float(sim),
-                "event_type": "UNCERTAIN_CANDIDATE",
+                "camera_id": camera_id,
+                "track_id": track_id,
+                "profile_id": best_profile_id,
+                "confidence": sim,
+                "event_type": "KNOWN_IDENTITY",
                 "timestamp": now,
                 "bbox": [int(x) for x in bbox],
-                "crop_path": str(crop_file_path),
-                "review_required": True
-            }
-            await mongo_db.save_detection_event(event_doc)
-            logger.info(f"[{camera_id}] UNCERTAIN Logged: Track #{track_id} {name} ({sim:.2f})")
-
-        else:
-            # Debounce auto-enrollment: Require 2 consecutive low-confidence attempts before creating a new visitor profile
-            curr_count = stream_worker.track_manager.track_low_conf_counts.get(track_id, 0) + 1
-            stream_worker.track_manager.track_low_conf_counts[track_id] = curr_count
-
-            if curr_count < 2:
-                label = f"#{track_id} Evaluating..."
-                stream_worker.track_manager.set_track_identity(track_id, "Pending", label, is_new_visit=False)
-                # Reset track state to PENDING so next frame retries evaluation
-                stream_worker.track_manager.track_states[track_id] = "PENDING"
-                logger.debug(f"[{camera_id}] Track #{track_id} low confidence attempt {curr_count}/2 (sim {sim:.2f}). Debouncing auto-enroll.")
-                return
-
-            # Auto-Enroll New Identity (sim < LOW_CONF_THRESH after 2+ consistent attempts)
-            stream_worker.track_manager.track_low_conf_counts.pop(track_id, None)
-            self.counter += 1
-            new_profile_id = f"VISITOR_{now.strftime('%m%d')}_{self.counter}"
-            label = f"#{track_id} {new_profile_id} ({sim:.2f})"
-            
-            # Save new vector to FAISS and MongoDB
-            faiss_manager.add_vector(emb, new_profile_id, new_profile_id)
-            await mongo_db.save_or_update_profile(new_profile_id, emb.tolist(), new_profile_id)
-
-            stream_worker.track_manager.set_track_identity(track_id, new_profile_id, label, is_new_visit=True)
-            
-            # Save crop with new profile_id folder name
-            new_crop_path = crop_storage.save_crop(crop, new_profile_id, track_id)
-
-            event_doc = {
-                "camera_id": str(camera_id),
-                "track_id": int(track_id),
-                "profile_id": str(new_profile_id),
-                "confidence": float(sim),
-                "event_type": "NEW_IDENTITY",
-                "timestamp": now,
-                "bbox": [int(x) for x in bbox],
-                "crop_path": str(new_crop_path),
+                "crop_path": crop_file_path,
                 "review_required": False
             }
-            await mongo_db.save_detection_event(event_doc)
-            logger.info(f"[{camera_id}] NEW_IDENTITY Auto-Enrolled & Logged: Track #{track_id} {new_profile_id}")
+            if stream_worker.loop and stream_worker.loop.is_running():
+                asyncio.run_coroutine_threadsafe(mongo_db.save_detection_event(event_doc), stream_worker.loop)
 
-        # Persist FAISS index periodically
-        faiss_manager.save_to_disk()
+            logger.info("[%s] KNOWN IDENTITY RESOLVED: Track #%d -> %s (sim=%.2f)", camera_id, track_id, name, sim)
+            return
+
+        # Low confidence match: count evaluation attempts
+        manager = stream_worker.track_manager
+        current_low_count = manager.track_low_conf_counts.get(track_id, 0) + 1
+        manager.track_low_conf_counts[track_id] = current_low_count
+
+        if current_low_count >= settings.MAX_EVAL_ATTEMPTS:
+            # Resolve as Unknown after MAX_EVAL_ATTEMPTS clear quality evaluations fail to match known profiles
+            label = f"#{track_id} Unknown"
+            manager.set_track_identity(track_id, "Unknown", label, is_new_visit=False)
+            logger.info("[%s] Track #%d RESOLVED as Unknown after %d evaluations", camera_id, track_id, current_low_count)

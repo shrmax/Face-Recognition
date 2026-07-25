@@ -98,20 +98,37 @@ async def enroll_uploads(uploads_dir: str = "./uploads"):
                 logger.warning(f"  No face detected in {file}")
                 continue
 
-            for face in faces:
-                emb = face.embedding
-                emb_norm = (emb / np.linalg.norm(emb)).tolist()
-                embeddings.append(emb_norm)
-                faiss_vectors.append(emb / np.linalg.norm(emb))
+            face = max(faces, key=lambda f: float(getattr(f, 'det_score', 0.0)))
+            det_score = float(getattr(face, 'det_score', 0.0))
+            if det_score < 0.40:
+                logger.warning(f"  Low confidence face detection in {file} (det_score={det_score:.2f} < 0.40), skipping")
+                continue
+
+            emb = face.embedding
+            norm_vec = (emb / (np.linalg.norm(emb) + 1e-6)).astype(np.float32)
+
+            # Deduplication check against already enrolled vectors for this profile
+            is_duplicate = False
+            for existing_vec in embeddings:
+                existing_np = np.array(existing_vec, dtype=np.float32)
+                sim = float(np.dot(norm_vec, existing_np))
+                if sim > settings.DEDUP_SIM_THRESH:
+                    logger.info(f"  Skipping near-duplicate image {file} (similarity={sim:.3f} > {settings.DEDUP_SIM_THRESH})")
+                    is_duplicate = True
+                    break
+
+            if not is_duplicate:
+                embeddings.append(norm_vec.tolist())
+                faiss_vectors.append(norm_vec)
                 faiss_ids.append(profile_id)
                 faiss_names[profile_id] = display_name
-                logger.info(f"  Extracted face embedding from: {file}")
+                logger.info(f"  Enrolled unique face embedding from: {file}")
 
         if embeddings:
             doc = {
                 'profile_id': profile_id,
                 'name': display_name,
-                'embeddings': embeddings[:settings.MAX_GALLERY_EMBEDDINGS],
+                'embeddings': embeddings,
                 'sample_count': len(embeddings),
                 'img_count': len(img_files),
                 'status': 'active'

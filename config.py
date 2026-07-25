@@ -1,5 +1,6 @@
 import os
-from typing import TYPE_CHECKING
+from typing import List, Tuple, Union, TYPE_CHECKING
+import onnxruntime as ort
 
 if TYPE_CHECKING:
     from pydantic_settings import BaseSettings
@@ -9,53 +10,130 @@ else:
     except ImportError:
         from pydantic import BaseSettings  # Fallback for standard pydantic v1/v2
 
+# ---------------------------------------------------------------------------
+# Paths & Default Model Locations
+# ---------------------------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(BASE_DIR, "models")
+HEAD_DETECTOR_MODEL_PATH = os.path.join(MODELS_DIR, "yolov11_phd_s.onnx")
+
+# ---------------------------------------------------------------------------
+# Head Detector (YOLOv11 - person head detection, class 1: "head", class 0: "person")
+# ---------------------------------------------------------------------------
+HEAD_DETECTOR = {
+    "model_path": HEAD_DETECTOR_MODEL_PATH,
+    "input_size": (640, 640),        # (w, h) - MUST match ONNX export dimensions
+    "conf_threshold": 0.35,          # Detection confidence threshold
+    "nms_threshold": 0.45,           # IoU threshold for NMS
+    "head_class_id": 1,              # 0 = person/body, 1 = HEAD ONLY
+    "num_classes": 2,                # Person + Head
+    # Preference order — fastest available ONNX runtime execution provider is chosen
+    "providers": [
+        "OpenVINOExecutionProvider",  # Intel CPU/iGPU hardware acceleration
+        "CUDAExecutionProvider",      # NVIDIA GPU acceleration
+        "CoreMLExecutionProvider",    # Apple Silicon / macOS hardware acceleration
+        "CPUExecutionProvider",      # Universal fallback
+    ],
+    "intra_op_threads": max(1, (os.cpu_count() or 2) // 2),
+    "inter_op_threads": 1,
+}
+
+# ---------------------------------------------------------------------------
+# Tracker (ByteTrack-style: IoU + Kalman filter)
+# ---------------------------------------------------------------------------
+TRACKER = {
+    "track_thresh": 0.5,     # Detections above this score are high-confidence
+    "low_thresh": 0.1,       # Low confidence threshold for 2nd pass matching
+    "match_thresh": 0.8,     # Cost ceiling (1 - IoU) for matching (0.8 = IoU >= 0.2)
+    "track_buffer": 30,      # Frame buffer to keep lost tracks alive (~1s @ 30fps)
+    "min_box_area": 100,     # Discard tiny boxes in px^2
+    "frame_rate": 25,        # Nominal camera FPS
+}
+
+# ---------------------------------------------------------------------------
+# RTSP / Stream Processing Pipeline Performance Tuning
+# ---------------------------------------------------------------------------
+PIPELINE = {
+    "detect_every_n_frames": 3,     # Run YOLO detector every Nth frame; tracker predicts in between
+    "reconnect_delay_sec": 2.0,     # RTSP reconnect delay
+    "queue_size": 1,                # Drop stale frames, always keep latest frame
+    "max_reconnect_attempts": 0,    # 0 = retry indefinitely
+    "socket_fps": 30,               # Target WebSocket broadcast FPS
+}
+
+
+def get_available_providers() -> List[str]:
+    """Intersection of configured provider preferences with ONNX Runtime available providers."""
+    available = ort.get_available_providers()
+    chosen = [p for p in HEAD_DETECTOR["providers"] if p in available]
+    return chosen or ["CPUExecutionProvider"]
+
+
 class Settings(BaseSettings):
     # App Config
     HOST: str = "0.0.0.0"
     PORT: int = 8000
     DEBUG: bool = False
-    
+
     # MongoDB Config
     MONGO_URI: str = os.getenv("MONGO_URI", "mongodb://localhost:27017")
     MONGO_DB_NAME: str = os.getenv("MONGO_DB_NAME", "face_recognition_db")
-    
+
     # Dataset & Storage Paths
     VIDEOS_FOLDER: str = os.getenv("VIDEOS_FOLDER", "./Employee")
     CROP_DIR: str = os.getenv("CROP_DIR", "./crops")
     FAISS_INDEX_PATH: str = "faiss_index.bin"
     KNOWN_IDS_PATH: str = "known_ids.pkl"
     EMBEDDINGS_PATH: str = "known_embeddings.pkl"
-    
-    # SCRFD Face Detection Parameters (tuned for wide-angle overhead CCTV camera feeds)
-    DET_WIDTH: int = 1280
-    DET_HEIGHT: int = 1280
-    DET_THRESH: float = 0.20
-    MAX_FACES: int = 0  # 0 = unlimited face detection (100+ crowd per frame)
-    
+
+    # Head Detection Parameters
+    HEAD_MODEL_PATH: str = HEAD_DETECTOR_MODEL_PATH
+    HEAD_CLASS_ID: int = 1  # 1 = HEAD ONLY
+    HEAD_NET_SCALE_FACTOR: float = 0.0039215697906911373
+    HEAD_DET_SIZE: int = 640
+    HEAD_DET_CONF: float = 0.35
+    HEAD_DET_IOU: float = 0.45
+    DET_WIDTH: int = 640   # Optimized SCRFD detection width for fast head crop processing
+    DET_HEIGHT: int = 640  # Optimized SCRFD detection height for fast head crop processing
+    DET_THRESH: float = 0.20  # High-precision SCRFD face detection threshold
+    MAX_FACES: int = 0  # 0 = unlimited
+
     # Sampling & Performance
-    SAMPLE_FPS: int = 12  # AI Detection & Tracking FPS
+    SAMPLE_FPS: int = 4   # Optimized sampling interval (1 crop every 250ms gives time for frontal pose)
+    TRACKING_FPS: int = 25 # Head Detection & ByteTrack Update FPS
     WATCHDOG_TIMEOUT_SECONDS: float = 5.0
-    SOCKET_MAX_WIDTH: int = 1280  # 720p max width for WebSocket streaming output
-    SOCKET_MAX_HEIGHT: int = 720  # 720p max height for WebSocket streaming output
-    
+    REVERIFY_INTERVAL_SECONDS: float = 45.0
+    SOCKET_MAX_WIDTH: int = 1280
+    SOCKET_MAX_HEIGHT: int = 720
+
     # Quality & Blur Filtering
-    MIN_BLUR_VAR: float = 15.0   # Laplacian variance threshold
-    MIN_FACE_SIZE: int = 12      # Min bounding box width/height in pixels for small distant faces
-    
+    MIN_BLUR_VAR: float = 35.0   # Strict zero-blur check (discards all blurry/defocused crops below 35.0)
+    MIN_DET_SCORE: float = 0.50  # High confidence SCRFD threshold (requires clear full face)
+    MIN_FACE_SIZE: int = 16
+    MIN_FACE_CROP_SIZE: int = 24 # Minimum face resolution (24x24px) for reliable ArcFace 512D embedding
+
     # FAISS Dual Thresholds & Multi-Vector Gallery
-    HIGH_CONF_THRESH: float = 0.42  # Match threshold for known profile (optimized for RTSP video)
-    LOW_CONF_THRESH: float = 0.28   # Below this = Auto-enroll new identity
-    MAX_GALLERY_EMBEDDINGS: int = 5 # Max representative vectors per profile in FAISS
-    
+    HIGH_CONF_THRESH: float = 0.60  # High-accuracy similarity match threshold
+    LOW_CONF_THRESH: float = 0.32
+    MAX_EVAL_ATTEMPTS: int = 8      # Maximum clear evaluation attempts before locking Unknown
+    DEDUP_SIM_THRESH: float = 0.95  # Vector similarity threshold to prune duplicate photos during enrollment
+    MAX_GALLERY_EMBEDDINGS: int = 5
+
     # Cooldown & Retention Policy
-    VISIT_COOLDOWN_MINS: int = 3   # Suppress duplicate alerts for 3 mins during temporary track loss
-    RETENTION_DAYS: int = 30       # Retention period for logs and face crop files
-    
+    VISIT_COOLDOWN_MINS: int = 3
+    RETENTION_DAYS: int = 30
+
     # RTSP Stream URLs (comma-separated camera_id=rtsp_url pairs)
     RTSP_STREAMS: str = ""
-    
+
+    # Pipeline & Models exposure
+    HEAD_DETECTOR_CFG: dict[str, Union[int, float, str, list[str], tuple[int, int]]] = HEAD_DETECTOR
+    TRACKER_CFG: dict[str, Union[float, int]] = TRACKER
+    PIPELINE_CFG: dict[str, Union[int, float]] = PIPELINE
+
     class Config:
         env_file = ".env"
         extra = "allow"
+
 
 settings = Settings()
