@@ -36,7 +36,7 @@ def get_face_detector() -> FaceAnalysis:
         with _face_detector_lock:
             if _face_detector_instance is None:
                 app = FaceAnalysis(
-                    name='buffalo_m',
+                    name='buffalo_s',
                     providers=['CUDAExecutionProvider', 'CoreMLExecutionProvider', 'CPUExecutionProvider'],
                     allowed_modules=['detection', 'recognition']
                 )
