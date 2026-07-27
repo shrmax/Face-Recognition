@@ -75,13 +75,30 @@ class MongoDBManager:
             logger.error(f"Failed to insert detection event: {e}")
             return False
 
-    async def get_recent_events(self, limit: int = 50, camera_id: Optional[str] = None) -> List[Dict[str, object]]:
+    async def get_recent_events(
+        self,
+        limit: int = 50,
+        camera_id: Optional[str] = None,
+        profile_id: Optional[str] = None,
+        date_str: Optional[str] = None
+    ) -> List[Dict[str, object]]:
         if self.db is None:
             return []
         try:
             query = {}
-            if camera_id:
-                query["camera_id"] = camera_id
+            if camera_id and camera_id.strip():
+                query["camera_id"] = camera_id.strip()
+            if profile_id and profile_id.strip():
+                query["profile_id"] = profile_id.strip().lower()
+            if date_str and date_str.strip():
+                try:
+                    from datetime import datetime, time, timezone
+                    dt_start = datetime.strptime(date_str.strip(), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    dt_end = datetime.combine(dt_start.date(), time.max, tzinfo=timezone.utc)
+                    query["timestamp"] = {"$gte": dt_start, "$lte": dt_end}
+                except Exception as ex:
+                    logger.warning(f"Invalid date filter '{date_str}': {ex}")
+
             cursor = self.db["detection_events"].find(query).sort("timestamp", -1).limit(limit)
             events = []
             async for doc in cursor:

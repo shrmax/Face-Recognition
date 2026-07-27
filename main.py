@@ -17,8 +17,10 @@ from controllers.stream_controller import stream_controller
 
 from api.profile_router import router as profile_router
 from api.stream_router import router as stream_router
+from api.log_router import router as log_router
 from views.profile_view import router as profile_view_router
 from views.stream_view import router as stream_view_router
+from views.log_view import router as log_view_router
 
 # Configure Logging
 logging.basicConfig(
@@ -138,8 +140,10 @@ async def periodic_retention_cleanup():
 # Register MVC Routers
 app.include_router(profile_router)
 app.include_router(stream_router)
+app.include_router(log_router)
 app.include_router(profile_view_router)
 app.include_router(stream_view_router)
+app.include_router(log_view_router)
 
 
 if __name__ == "__main__":

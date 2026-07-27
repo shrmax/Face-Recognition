@@ -5,6 +5,7 @@ Shared MVC View Layout module providing consistent navigation, branding, dark-mo
 def render_layout(title: str, active_tab: str, content: str) -> str:
     stream_active = "active" if active_tab == "stream" else "inactive"
     profiles_active = "active" if active_tab == "profiles" else "inactive"
+    logs_active = "active" if active_tab == "logs" else "inactive"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -178,7 +179,10 @@ def render_layout(title: str, active_tab: str, content: str) -> str:
                 <span>🎥 Live Monitor</span>
             </a>
             <a href="/profiles-ui" class="nav-link {profiles_active}">
-                <span>👤 Person Profiles & Enrollment</span>
+                <span>👤 Person Profiles</span>
+            </a>
+            <a href="/logs-ui" class="nav-link {logs_active}">
+                <span>📋 Detection Activity Logs</span>
             </a>
             <a href="/docs" target="_blank" class="nav-link inactive">
                 <span>📖 API Docs</span>

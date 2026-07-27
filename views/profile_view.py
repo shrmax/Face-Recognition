@@ -408,6 +408,7 @@ async def get_profiles_ui_page():
                         </div>
                         <div class="card-actions">
                             <button class="btn-outline" onclick="openUploadPhotoModal('${escapeHtml(p.profile_id)}', '${escapeHtml(p.name)}')">📷 Add Photo</button>
+                            <a href="/logs-ui?profile_id=${encodeURIComponent(p.profile_id)}" class="btn-outline" style="text-decoration: none; text-align: center;">📋 Activity Logs</a>
                             <button class="btn-danger" onclick="deleteProfile('${escapeHtml(p.profile_id)}')">🗑️ Delete</button>
                         </div>
                     </div>
