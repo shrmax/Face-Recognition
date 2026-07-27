@@ -149,4 +149,28 @@ class MongoDBManager:
             logger.error(f"Failed to load profiles: {e}")
             return []
 
+    async def get_profile(self, profile_id: str) -> Optional[Dict[str, object]]:
+        if self.db is None:
+            return None
+        try:
+            doc = await self.db["face_profiles"].find_one({"profile_id": profile_id})
+            if doc:
+                doc["_id"] = str(doc["_id"])
+                return doc
+            return None
+        except Exception as e:
+            logger.error(f"Failed to fetch profile {profile_id}: {e}")
+            return None
+
+    async def delete_profile(self, profile_id: str) -> bool:
+        if self.db is None:
+            return False
+        try:
+            result = await self.db["face_profiles"].delete_one({"profile_id": profile_id})
+            return result.deleted_count > 0
+        except Exception as e:
+            logger.error(f"Failed to delete profile {profile_id}: {e}")
+            return False
+
 mongo_db = MongoDBManager()
+
