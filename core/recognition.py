@@ -192,17 +192,37 @@ class RecognitionWorker:
             logger.debug("[%s] Track #%d eye distance too small (%.1fpx < 12.0px), skipping", camera_id, track_id, eye_dist)
             return
 
-        # 2. Vertical Landmark Alignment Check (eyes above nose, nose above mouth)
-        eye_center_y = (left_eye[1] + right_eye[1]) / 2.0
-        mouth_center_y = (left_mouth[1] + right_mouth[1]) / 2.0
-        if not (eye_center_y < nose[1] < mouth_center_y):
+        # 2. Roll Tilt Check (sideways head tilt)
+        eye_diff_y = abs(float(left_eye[1] - right_eye[1]))
+        if (eye_diff_y / (eye_dist + 1e-5)) > 0.35:
+            logger.debug("[%s] Track #%d sideways roll tilt rejected, skipping", camera_id, track_id)
+            return
+
+        # 3. Vertical Landmark Alignment & Pitch Check (eyes above nose, nose above mouth)
+        eye_center_y = (float(left_eye[1]) + float(right_eye[1])) / 2.0
+        mouth_center_y = (float(left_mouth[1]) + float(right_mouth[1])) / 2.0
+        if not (eye_center_y < float(nose[1]) < mouth_center_y):
             logger.debug("[%s] Track #%d vertical landmark misalignment (tilted/profile face), skipping", camera_id, track_id)
             return
 
-        # 3. Horizontal Pose Symmetry Check (Nose centered relative to eyes, max 0.45 offset)
-        eye_center_x = (left_eye[0] + right_eye[0]) / 2.0
-        eye_span_x = abs(right_eye[0] - left_eye[0]) + 1e-5
-        nose_offset_x = abs(nose[0] - eye_center_x) / eye_span_x
+        d_eye_nose = float(nose[1]) - eye_center_y
+        d_nose_mouth = mouth_center_y - float(nose[1])
+        d_eye_mouth = mouth_center_y - eye_center_y
+
+        # Pitch Down check (head bowed down): nose is too close to mouth or pitch ratio > 1.45
+        if (d_nose_mouth / (d_eye_mouth + 1e-5)) < 0.35 or (d_eye_nose / (d_nose_mouth + 1e-5)) > 1.45:
+            logger.debug("[%s] Track #%d downward pitch tilt (looking down), skipping", camera_id, track_id)
+            return
+
+        # Pitch Up check (head tilted up): nose too close to eyes
+        if (d_eye_nose / (d_eye_mouth + 1e-5)) < 0.25 or (d_eye_nose / (d_nose_mouth + 1e-5)) < 0.55:
+            logger.debug("[%s] Track #%d upward pitch tilt (looking up), skipping", camera_id, track_id)
+            return
+
+        # 4. Horizontal Pose Symmetry Check (Nose centered relative to eyes, max 0.45 offset)
+        eye_center_x = (float(left_eye[0]) + float(right_eye[0])) / 2.0
+        eye_span_x = abs(float(right_eye[0]) - float(left_eye[0])) + 1e-5
+        nose_offset_x = abs(float(nose[0]) - eye_center_x) / eye_span_x
         if nose_offset_x > 0.45:
             logger.debug("[%s] Track #%d side-profile pose rejected (nose_offset=%.2f > 0.45), skipping", camera_id, track_id, nose_offset_x)
             return
