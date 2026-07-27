@@ -80,19 +80,9 @@ async def lifespan(app: FastAPI):
     # 5. Schedule daily retention cleanup task
     asyncio.create_task(periodic_retention_cleanup())
 
-    # 6. Auto-start RTSP streams configured in settings / .env
-    if settings.RTSP_STREAMS.strip():
-        loop = asyncio.get_event_loop()
-        for idx, rtsp_url in enumerate(settings.RTSP_STREAMS.split(","), start=1):
-            rtsp_url = rtsp_url.strip()
-            if not rtsp_url:
-                continue
-            camera_id = f"cam_{idx}"
-            try:
-                stream_controller.add_stream(camera_id, rtsp_url, loop)
-                logger.info(f"Auto-started stream worker: {camera_id} -> {rtsp_url}")
-            except Exception as e:
-                logger.error(f"Error starting stream {camera_id}: {e}")
+    # 6. Auto-start RTSP streams stored in MongoDB (Max 4 limit)
+    loop = asyncio.get_event_loop()
+    await stream_controller.initialize_streams_from_db(loop)
 
     logger.info("Service initialized successfully.")
     logger.info(f"Live Monitor UI: http://{settings.HOST}:{settings.PORT}/stream")
