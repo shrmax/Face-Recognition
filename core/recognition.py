@@ -1,4 +1,5 @@
 import os
+import cv2
 import faiss
 import pickle
 import numpy as np
@@ -36,7 +37,7 @@ def get_face_detector() -> FaceAnalysis:
         with _face_detector_lock:
             if _face_detector_instance is None:
                 app = FaceAnalysis(
-                    name='buffalo_m',
+                    name='buffalo_s',
                     providers=['CUDAExecutionProvider', 'CoreMLExecutionProvider', 'CPUExecutionProvider'],
                     allowed_modules=['detection', 'recognition']
                 )
@@ -192,17 +193,37 @@ class RecognitionWorker:
             logger.debug("[%s] Track #%d eye distance too small (%.1fpx < 12.0px), skipping", camera_id, track_id, eye_dist)
             return
 
-        # 2. Vertical Landmark Alignment Check (eyes above nose, nose above mouth)
-        eye_center_y = (left_eye[1] + right_eye[1]) / 2.0
-        mouth_center_y = (left_mouth[1] + right_mouth[1]) / 2.0
-        if not (eye_center_y < nose[1] < mouth_center_y):
+        # 2. Roll Tilt Check (sideways head tilt)
+        eye_diff_y = abs(float(left_eye[1] - right_eye[1]))
+        if (eye_diff_y / (eye_dist + 1e-5)) > 0.35:
+            logger.debug("[%s] Track #%d sideways roll tilt rejected, skipping", camera_id, track_id)
+            return
+
+        # 3. Vertical Landmark Alignment & Pitch Check (eyes above nose, nose above mouth)
+        eye_center_y = (float(left_eye[1]) + float(right_eye[1])) / 2.0
+        mouth_center_y = (float(left_mouth[1]) + float(right_mouth[1])) / 2.0
+        if not (eye_center_y < float(nose[1]) < mouth_center_y):
             logger.debug("[%s] Track #%d vertical landmark misalignment (tilted/profile face), skipping", camera_id, track_id)
             return
 
-        # 3. Horizontal Pose Symmetry Check (Nose centered relative to eyes, max 0.45 offset)
-        eye_center_x = (left_eye[0] + right_eye[0]) / 2.0
-        eye_span_x = abs(right_eye[0] - left_eye[0]) + 1e-5
-        nose_offset_x = abs(nose[0] - eye_center_x) / eye_span_x
+        d_eye_nose = float(nose[1]) - eye_center_y
+        d_nose_mouth = mouth_center_y - float(nose[1])
+        d_eye_mouth = mouth_center_y - eye_center_y
+
+        # Pitch Down check (head bowed down): nose is too close to mouth or pitch ratio > 1.45
+        if (d_nose_mouth / (d_eye_mouth + 1e-5)) < 0.35 or (d_eye_nose / (d_nose_mouth + 1e-5)) > 1.45:
+            logger.debug("[%s] Track #%d downward pitch tilt (looking down), skipping", camera_id, track_id)
+            return
+
+        # Pitch Up check (head tilted up): nose too close to eyes
+        if (d_eye_nose / (d_eye_mouth + 1e-5)) < 0.25 or (d_eye_nose / (d_nose_mouth + 1e-5)) < 0.55:
+            logger.debug("[%s] Track #%d upward pitch tilt (looking up), skipping", camera_id, track_id)
+            return
+
+        # 4. Horizontal Pose Symmetry Check (Nose centered relative to eyes, max 0.45 offset)
+        eye_center_x = (float(left_eye[0]) + float(right_eye[0])) / 2.0
+        eye_span_x = abs(float(right_eye[0]) - float(left_eye[0])) + 1e-5
+        nose_offset_x = abs(float(nose[0]) - eye_center_x) / eye_span_x
         if nose_offset_x > 0.45:
             logger.debug("[%s] Track #%d side-profile pose rejected (nose_offset=%.2f > 0.45), skipping", camera_id, track_id, nose_offset_x)
             return
@@ -227,8 +248,22 @@ class RecognitionWorker:
             label = f"#{track_id} {name} ({sim:.2f})"
             stream_worker.track_manager.set_track_identity(track_id, best_profile_id, label, is_new_visit=True)
 
-            # Save face crop
+            # 1. Save close-up face crop image
             crop_file_path = crop_storage.save_crop(face_crop, best_profile_id, track_id)
+
+            # 2. Draw green bounding box & identity tag on full camera frame snapshot
+            full_frame_file_path = ""
+            raw_frame = job.get("raw_frame")
+            if raw_frame is not None and isinstance(raw_frame, np.ndarray) and raw_frame.size > 0:
+                annotated_frame = raw_frame.copy()
+                cx1, cy1, cx2, cy2 = [int(v) for v in bbox]
+                cv2.rectangle(annotated_frame, (cx1, cy1), (cx2, cy2), (0, 255, 0), 2)
+                display_txt = f"{name} ({sim * 100:.1f}%)"
+                txt_w = len(display_txt) * 11
+                cv2.rectangle(annotated_frame, (cx1, max(0, cy1 - 26)), (cx1 + txt_w, max(26, cy1)), (0, 255, 0), -1)
+                cv2.putText(annotated_frame, display_txt, (cx1 + 4, max(18, cy1 - 7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+                full_frame_file_path = crop_storage.save_full_frame(annotated_frame, best_profile_id, track_id)
+
             event_doc = {
                 "camera_id": camera_id,
                 "track_id": track_id,
@@ -238,10 +273,29 @@ class RecognitionWorker:
                 "timestamp": now,
                 "bbox": [int(x) for x in bbox],
                 "crop_path": crop_file_path,
+                "full_frame_path": full_frame_file_path,
                 "review_required": False
             }
-            if stream_worker.loop and stream_worker.loop.is_running():
-                asyncio.run_coroutine_threadsafe(mongo_db.save_detection_event(event_doc), stream_worker.loop)
+
+            target_loop = stream_worker.loop if (stream_worker and stream_worker.loop and stream_worker.loop.is_running()) else None
+            if target_loop is None:
+                try:
+                    target_loop = asyncio.get_event_loop()
+                except Exception:
+                    target_loop = None
+
+            if target_loop and target_loop.is_running():
+                fut = asyncio.run_coroutine_threadsafe(mongo_db.save_detection_event(event_doc), target_loop)
+                def _on_event_saved(f):
+                    try:
+                        ok = f.result()
+                        if ok:
+                            logger.info("[%s] Saved detection event (Face Crop & Full Frame) to MongoDB for Track #%d (%s)", camera_id, track_id, best_profile_id)
+                        else:
+                            logger.warning("[%s] Failed to save detection event to MongoDB for Track #%d", camera_id, track_id)
+                    except Exception as ex:
+                        logger.error("[%s] Error in save_detection_event for Track #%d: %s", camera_id, track_id, ex)
+                fut.add_done_callback(_on_event_saved)
 
             logger.info("[%s] KNOWN IDENTITY RESOLVED: Track #%d -> %s (sim=%.2f)", camera_id, track_id, name, sim)
             return

@@ -75,13 +75,30 @@ class MongoDBManager:
             logger.error(f"Failed to insert detection event: {e}")
             return False
 
-    async def get_recent_events(self, limit: int = 50, camera_id: Optional[str] = None) -> List[Dict[str, object]]:
+    async def get_recent_events(
+        self,
+        limit: int = 50,
+        camera_id: Optional[str] = None,
+        profile_id: Optional[str] = None,
+        date_str: Optional[str] = None
+    ) -> List[Dict[str, object]]:
         if self.db is None:
             return []
         try:
             query = {}
-            if camera_id:
-                query["camera_id"] = camera_id
+            if camera_id and camera_id.strip():
+                query["camera_id"] = camera_id.strip()
+            if profile_id and profile_id.strip():
+                query["profile_id"] = profile_id.strip().lower()
+            if date_str and date_str.strip():
+                try:
+                    from datetime import datetime, time, timezone
+                    dt_start = datetime.strptime(date_str.strip(), "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    dt_end = datetime.combine(dt_start.date(), time.max, tzinfo=timezone.utc)
+                    query["timestamp"] = {"$gte": dt_start, "$lte": dt_end}
+                except Exception as ex:
+                    logger.warning(f"Invalid date filter '{date_str}': {ex}")
+
             cursor = self.db["detection_events"].find(query).sort("timestamp", -1).limit(limit)
             events = []
             async for doc in cursor:
@@ -148,5 +165,93 @@ class MongoDBManager:
         except Exception as e:
             logger.error(f"Failed to load profiles: {e}")
             return []
+
+    async def get_profile(self, profile_id: str) -> Optional[Dict[str, object]]:
+        if self.db is None:
+            return None
+        try:
+            doc = await self.db["face_profiles"].find_one({"profile_id": profile_id})
+            if doc:
+                doc["_id"] = str(doc["_id"])
+                return doc
+            return None
+        except Exception as e:
+            logger.error(f"Failed to fetch profile {profile_id}: {e}")
+            return None
+
+    async def delete_profile(self, profile_id: str) -> bool:
+        if self.db is None:
+            return False
+        try:
+            res = await self.db["face_profiles"].delete_one({"profile_id": profile_id.lower().strip()})
+            return res.deleted_count > 0
+        except Exception as e:
+            logger.error(f"Failed to delete profile {profile_id}: {e}")
+            return False
+
+    # --- RTSP STREAMS COLLECTION HELPERS ---
+
+    async def save_rtsp_stream(self, camera_id: str, rtsp_url: str, name: Optional[str] = None) -> bool:
+        if self.db is None:
+            return False
+        try:
+            cid = camera_id.strip()
+            url = rtsp_url.strip()
+            display_name = name.strip() if name else f"Camera {cid}"
+            now = datetime.now(timezone.utc)
+
+            await self.db["rtsp_streams"].update_one(
+                {"camera_id": cid},
+                {
+                    "$set": {
+                        "camera_id": cid,
+                        "rtsp_url": url,
+                        "name": display_name,
+                        "updated_at": now,
+                        "status": "active"
+                    },
+                    "$setOnInsert": {
+                        "created_at": now
+                    }
+                },
+                upsert=True
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save RTSP stream {camera_id}: {e}")
+            return False
+
+    async def load_all_rtsp_streams(self) -> List[Dict[str, object]]:
+        if self.db is None:
+            return []
+        try:
+            cursor = self.db["rtsp_streams"].find({"status": "active"}).sort("camera_id", 1)
+            streams = []
+            async for doc in cursor:
+                doc["_id"] = str(doc["_id"])
+                streams.append(doc)
+            return streams
+        except Exception as e:
+            logger.error(f"Failed to load RTSP streams: {e}")
+            return []
+
+    async def delete_rtsp_stream(self, camera_id: str) -> bool:
+        if self.db is None:
+            return False
+        try:
+            res = await self.db["rtsp_streams"].delete_one({"camera_id": camera_id.strip()})
+            return res.deleted_count > 0
+        except Exception as e:
+            logger.error(f"Failed to delete RTSP stream {camera_id}: {e}")
+            return False
+
+    async def count_rtsp_streams(self) -> int:
+        if self.db is None:
+            return 0
+        try:
+            return await self.db["rtsp_streams"].count_documents({"status": "active"})
+        except Exception as e:
+            logger.error(f"Failed to count RTSP streams: {e}")
+            return 0
 
 mongo_db = MongoDBManager()
