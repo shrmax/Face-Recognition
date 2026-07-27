@@ -1,4 +1,5 @@
 import os
+import cv2
 import faiss
 import pickle
 import numpy as np
@@ -247,8 +248,22 @@ class RecognitionWorker:
             label = f"#{track_id} {name} ({sim:.2f})"
             stream_worker.track_manager.set_track_identity(track_id, best_profile_id, label, is_new_visit=True)
 
-            # Save face crop
+            # 1. Save close-up face crop image
             crop_file_path = crop_storage.save_crop(face_crop, best_profile_id, track_id)
+
+            # 2. Draw green bounding box & identity tag on full camera frame snapshot
+            full_frame_file_path = ""
+            raw_frame = job.get("raw_frame")
+            if raw_frame is not None and isinstance(raw_frame, np.ndarray) and raw_frame.size > 0:
+                annotated_frame = raw_frame.copy()
+                cx1, cy1, cx2, cy2 = [int(v) for v in bbox]
+                cv2.rectangle(annotated_frame, (cx1, cy1), (cx2, cy2), (0, 255, 0), 2)
+                display_txt = f"{name} ({sim * 100:.1f}%)"
+                txt_w = len(display_txt) * 11
+                cv2.rectangle(annotated_frame, (cx1, max(0, cy1 - 26)), (cx1 + txt_w, max(26, cy1)), (0, 255, 0), -1)
+                cv2.putText(annotated_frame, display_txt, (cx1 + 4, max(18, cy1 - 7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+                full_frame_file_path = crop_storage.save_full_frame(annotated_frame, best_profile_id, track_id)
+
             event_doc = {
                 "camera_id": camera_id,
                 "track_id": track_id,
@@ -258,10 +273,29 @@ class RecognitionWorker:
                 "timestamp": now,
                 "bbox": [int(x) for x in bbox],
                 "crop_path": crop_file_path,
+                "full_frame_path": full_frame_file_path,
                 "review_required": False
             }
-            if stream_worker.loop and stream_worker.loop.is_running():
-                asyncio.run_coroutine_threadsafe(mongo_db.save_detection_event(event_doc), stream_worker.loop)
+
+            target_loop = stream_worker.loop if (stream_worker and stream_worker.loop and stream_worker.loop.is_running()) else None
+            if target_loop is None:
+                try:
+                    target_loop = asyncio.get_event_loop()
+                except Exception:
+                    target_loop = None
+
+            if target_loop and target_loop.is_running():
+                fut = asyncio.run_coroutine_threadsafe(mongo_db.save_detection_event(event_doc), target_loop)
+                def _on_event_saved(f):
+                    try:
+                        ok = f.result()
+                        if ok:
+                            logger.info("[%s] Saved detection event (Face Crop & Full Frame) to MongoDB for Track #%d (%s)", camera_id, track_id, best_profile_id)
+                        else:
+                            logger.warning("[%s] Failed to save detection event to MongoDB for Track #%d", camera_id, track_id)
+                    except Exception as ex:
+                        logger.error("[%s] Error in save_detection_event for Track #%d: %s", camera_id, track_id, ex)
+                fut.add_done_callback(_on_event_saved)
 
             logger.info("[%s] KNOWN IDENTITY RESOLVED: Track #%d -> %s (sim=%.2f)", camera_id, track_id, name, sim)
             return

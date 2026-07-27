@@ -106,7 +106,7 @@ async def get_logs_ui_page():
         .logs-container {
             display: flex;
             flex-direction: column;
-            gap: 14px;
+            gap: 16px;
             margin-top: 8px;
         }
         .log-card {
@@ -125,23 +125,32 @@ async def get_logs_ui_page():
             transform: translateY(-1px);
         }
 
-        /* Method A Face Crop Preview */
-        .crop-preview-box {
-            width: 84px;
-            height: 84px;
+        /* Full Camera Widescreen Frame Box (240x135) */
+        .full-frame-box {
+            width: 240px;
+            height: 135px;
             border-radius: 12px;
             overflow: hidden;
-            background: #0f172a;
+            background: #0b0f19;
             border: 1px solid #334155;
             flex-shrink: 0;
             display: flex;
             align-items: center;
             justify-content: center;
+            cursor: pointer;
+            position: relative;
+            transition: border-color 0.2s ease, transform 0.2s ease;
         }
-        .crop-img {
+        .full-frame-box:hover {
+            border-color: #38bdf8;
+            transform: scale(1.03);
+        }
+
+        .frame-img {
             width: 100%;
             height: 100%;
-            object-fit: cover;
+            object-fit: contain;
+            background: #0b0f19;
         }
         .no-crop-placeholder {
             color: #64748b;
@@ -153,7 +162,7 @@ async def get_logs_ui_page():
             flex: 1;
             display: flex;
             flex-direction: column;
-            gap: 6px;
+            gap: 8px;
         }
         .log-header-row {
             display: flex;
@@ -161,7 +170,7 @@ async def get_logs_ui_page():
             gap: 12px;
         }
         .log-person-name {
-            font-size: 1.1rem;
+            font-size: 1.15rem;
             font-weight: 700;
             color: #f8fafc;
         }
@@ -169,9 +178,9 @@ async def get_logs_ui_page():
             background: rgba(16, 185, 129, 0.15);
             color: #10b981;
             border: 1px solid rgba(16, 185, 129, 0.3);
-            padding: 3px 10px;
+            padding: 4px 12px;
             border-radius: 20px;
-            font-size: 0.78rem;
+            font-size: 0.8rem;
             font-weight: 600;
         }
         .log-conf-badge.low {
@@ -197,16 +206,58 @@ async def get_logs_ui_page():
             background: #0f172a;
             border: 1px solid #334155;
             color: #38bdf8;
-            padding: 2px 8px;
+            padding: 3px 8px;
             border-radius: 6px;
-            font-size: 0.78rem;
+            font-size: 0.8rem;
+        }
+
+        /* Image View Modal */
+        .image-modal-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(11, 15, 25, 0.9);
+            backdrop-filter: blur(10px);
+            z-index: 2000;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+        }
+        .image-modal-content {
+            position: relative;
+            max-width: 90vw;
+            max-height: 90vh;
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.7);
+            display: flex;
+            flex-direction: column;
+        }
+        .image-modal-header {
+            background: #0f172a;
+            padding: 12px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #334155;
+            color: #f8fafc;
+            font-weight: 700;
+        }
+        .image-modal-img {
+            max-width: 100%;
+            max-height: 80vh;
+            object-fit: contain;
+            background: #000000;
+            display: block;
         }
     </style>
 
     <div class="page-header">
         <div class="page-title">
             <h1>📋 Detection Event Activity Logs</h1>
-            <p>Historical face recognition timeline, Method A snapshot crops, and bounding box telemetry from CCTV feeds.</p>
+            <p>Full camera frame snapshots with bounding box overlay and identity telemetry.</p>
         </div>
     </div>
 
@@ -245,8 +296,18 @@ async def get_logs_ui_page():
         <div style="color: #64748b; font-size: 0.95rem;">Loading activity logs...</div>
     </div>
 
+    <!-- Image Modal -->
+    <div class="image-modal-overlay" id="imageModal" onclick="closeImageModal()">
+        <div class="image-modal-content" onclick="event.stopPropagation()">
+            <div class="image-modal-header">
+                <span id="imageModalTitle">Full Camera Frame Snapshot</span>
+                <button onclick="closeImageModal()" style="background:none; border:none; color:#94a3b8; font-size:1.5rem; cursor:pointer;">&times;</button>
+            </div>
+            <img class="image-modal-img" id="modalImg" src="" alt="Full Camera Frame Snapshot" />
+        </div>
+    </div>
+
     <script>
-        // Parse URL parameters (e.g. ?profile_id=shravan&date=2026-07-27)
         const urlParams = new URLSearchParams(window.location.search);
         const initProfileId = urlParams.get('profile_id') || '';
         const initDate = urlParams.get('date') || '';
@@ -320,19 +381,19 @@ async def get_logs_ui_page():
             }
 
             container.innerHTML = logs.map(l => {
-                const cropImgHtml = l.crop_url
-                    ? `<img src="${l.crop_url}" class="crop-img" alt="${l.name}" />`
-                    : '<div class="no-crop-placeholder">No Crop</div>';
+                const fullFrameUrl = l.full_frame_url || l.crop_url;
+                const frameImgHtml = fullFrameUrl
+                    ? `<img src="${fullFrameUrl}" class="frame-img" alt="${l.name} Full Frame" />`
+                    : '<div class="no-crop-placeholder">No Snapshot</div>';
 
                 const isLow = l.confidence < 0.60;
-                const badgeClass = isLow ? 'log-conf-badge low' : 'log-conf-badge';
                 const bboxStr = l.bbox && l.bbox.length === 4 ? `[${l.bbox.join(', ')}]` : 'N/A';
 
                 return `
                     <div class="log-card">
-                        <!-- Method A Face Crop Preview -->
-                        <div class="crop-preview-box">
-                            ${cropImgHtml}
+                        <!-- Full Widescreen Camera Frame Snapshot -->
+                        <div class="full-frame-box" title="Click to view full resolution camera frame" onclick="openImageModal('${fullFrameUrl}', '${escapeHtml(l.name)} - ${l.timestamp}')">
+                            ${frameImgHtml}
                         </div>
 
                         <div class="log-main">
@@ -349,6 +410,17 @@ async def get_logs_ui_page():
                     </div>
                 `;
             }).join('');
+        }
+
+        function openImageModal(imgUrl, title) {
+            document.getElementById('modalImg').src = imgUrl;
+            document.getElementById('imageModalTitle').textContent = title || 'Full Camera Frame Snapshot';
+            document.getElementById('imageModal').style.display = 'flex';
+        }
+
+        function closeImageModal() {
+            document.getElementById('imageModal').style.display = 'none';
+            document.getElementById('modalImg').src = '';
         }
 
         function applyFilters() {

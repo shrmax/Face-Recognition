@@ -7,6 +7,7 @@ from config import settings
 
 logger = logging.getLogger("crop_storage")
 
+
 class CropStorageManager:
     def __init__(self, base_dir: str = settings.CROP_DIR):
         self.base_dir = base_dir
@@ -19,10 +20,10 @@ class CropStorageManager:
         """
         try:
             today_str = datetime.now().strftime("%Y-%m-%d")
-            folder_path = os.path.join(self.base_dir, today_str, profile_id)
+            folder_path = os.path.join(self.base_dir, today_str, profile_id.lower().strip())
             os.makedirs(folder_path, exist_ok=True)
 
-            filename = f"track_{track_id}_{int(datetime.now().timestamp())}.jpg"
+            filename = f"face_{track_id}_{int(datetime.now().timestamp())}.jpg"
             file_path = os.path.join(folder_path, filename)
 
             # Compress slightly to save disk space
@@ -30,6 +31,25 @@ class CropStorageManager:
             return file_path
         except Exception as e:
             logger.error(f"Error saving face crop for profile {profile_id}: {e}")
+            return ""
+
+    def save_full_frame(self, frame_bgr, profile_id: str, track_id: int) -> str:
+        """
+        Saves an annotated full widescreen BGR camera frame snapshot to disk.
+        Returns the relative file path.
+        """
+        try:
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            folder_path = os.path.join(self.base_dir, today_str, profile_id.lower().strip())
+            os.makedirs(folder_path, exist_ok=True)
+
+            filename = f"frame_{track_id}_{int(datetime.now().timestamp())}.jpg"
+            file_path = os.path.join(folder_path, filename)
+
+            cv2.imwrite(file_path, frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            return file_path
+        except Exception as e:
+            logger.error(f"Error saving full frame for profile {profile_id}: {e}")
             return ""
 
     def prune_old_crops(self, retention_days: int = settings.RETENTION_DAYS):
@@ -53,5 +73,6 @@ class CropStorageManager:
                         continue
         except Exception as e:
             logger.error(f"Error pruning crop storage: {e}")
+
 
 crop_storage = CropStorageManager()

@@ -56,19 +56,22 @@ class LogController:
             conf = float(doc.get("confidence", 0.0))
             conf_pct = f"{round(conf * 100, 1)}%"
 
-            # Method A: Map local crop file path to static web URL (/crops/...)
-            raw_crop_path = str(doc.get("crop_path", "")).strip()
-            crop_url = ""
-            if raw_crop_path:
-                norm_path = raw_crop_path.replace("\\", "/")
-                if norm_path.startswith("./crops/"):
-                    crop_url = norm_path.replace("./crops/", "/crops/")
-                elif norm_path.startswith("crops/"):
-                    crop_url = norm_path.replace("crops/", "/crops/")
-                elif norm_path.startswith("/crops/"):
-                    crop_url = norm_path
-                else:
-                    crop_url = f"/crops/{norm_path}"
+            def _to_web_url(p: str) -> str:
+                if not p:
+                    return ""
+                norm = p.strip().replace("\\", "/")
+                if norm.startswith("./crops/"):
+                    return norm.replace("./crops/", "/crops/")
+                elif norm.startswith("crops/"):
+                    return norm.replace("crops/", "/crops/")
+                elif norm.startswith("/crops/"):
+                    return norm
+                return f"/crops/{norm}"
+
+            crop_url = _to_web_url(str(doc.get("crop_path", "")))
+            full_frame_url = _to_web_url(str(doc.get("full_frame_path", "")))
+            if not full_frame_url and crop_url:
+                full_frame_url = crop_url
 
             bbox = doc.get("bbox", [])
             bbox_list = [int(x) for x in bbox] if isinstance(bbox, (list, tuple)) else []
@@ -84,6 +87,7 @@ class LogController:
                 "timestamp": formatted_ts,
                 "bbox": bbox_list,
                 "crop_url": crop_url,
+                "full_frame_url": full_frame_url,
                 "event_type": str(doc.get("event_type", "KNOWN_IDENTITY"))
             })
 

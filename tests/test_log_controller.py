@@ -24,7 +24,8 @@ class TestLogController(unittest.IsolatedAsyncioTestCase):
             "event_type": "KNOWN_IDENTITY",
             "timestamp": now,
             "bbox": [100, 80, 220, 200],
-            "crop_path": "./crops/2026-07-27/shravan/track_4_1785125900.jpg"
+            "crop_path": "./crops/2026-07-27/shravan/face_4_1785125900.jpg",
+            "full_frame_path": "./crops/2026-07-27/shravan/frame_4_1785125900.jpg"
         }
 
         mock_mongo.get_recent_events = AsyncMock(return_value=[mock_event])
@@ -38,7 +39,8 @@ class TestLogController(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(log["name"], "Shravan")
         self.assertEqual(log["confidence_pct"], "88.5%")
         self.assertTrue(log["timestamp"].endswith("IST"))
-        self.assertEqual(log["crop_url"], "/crops/2026-07-27/shravan/track_4_1785125900.jpg")
+        self.assertEqual(log["crop_url"], "/crops/2026-07-27/shravan/face_4_1785125900.jpg")
+        self.assertEqual(log["full_frame_url"], "/crops/2026-07-27/shravan/frame_4_1785125900.jpg")
         self.assertEqual(log["bbox"], [100, 80, 220, 200])
 
     @patch("controllers.log_controller.mongo_db")

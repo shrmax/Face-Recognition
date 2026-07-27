@@ -319,7 +319,8 @@ class StreamWorker:
                         "track_id": t_id,
                         "crop": crop,
                         "bbox": [cx1, cy1, cx2, cy2],
-                        "stream_worker": self
+                        "stream_worker": self,
+                        "raw_frame": raw_frame.copy()
                     }
                     try:
                         asyncio.run_coroutine_threadsafe(self.job_queue.put(job_data), self.loop)

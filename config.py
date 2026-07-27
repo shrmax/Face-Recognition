@@ -54,7 +54,7 @@ TRACKER = {
 # RTSP / Stream Processing Pipeline Performance Tuning
 # ---------------------------------------------------------------------------
 PIPELINE = {
-    "detect_every_n_frames": 5,     # Run YOLO detector every 5th frame; tracker predicts in between
+    "detect_every_n_frames": 2,     # Run YOLO detector every 2nd frame for ultra-smooth responsive tracking
     "reconnect_delay_sec": 2.0,     # RTSP reconnect delay
     "queue_size": 1,                # Drop stale frames, always keep latest frame
     "max_reconnect_attempts": 0,    # 0 = retry indefinitely
@@ -99,7 +99,7 @@ class Settings(BaseSettings):
     MAX_FACES: int = 0  # 0 = unlimited
 
     # Sampling & Performance
-    SAMPLE_FPS: int = 2   # Optimized sampling interval (1 crop every 500ms gives time for frontal pose)
+    SAMPLE_FPS: int = 4   # Fast sampling interval (1 crop every 250ms for rapid face recognition)
     TRACKING_FPS: int = 25 # Head Detection & ByteTrack Update FPS
     WATCHDOG_TIMEOUT_SECONDS: float = 5.0
     REVERIFY_INTERVAL_SECONDS: float = 45.0
@@ -113,7 +113,7 @@ class Settings(BaseSettings):
     MIN_FACE_CROP_SIZE: int = 24 # Minimum face resolution (24x24px) for reliable ArcFace 512D embedding
 
     # FAISS Dual Thresholds & Multi-Vector Gallery
-    HIGH_CONF_THRESH: float = 0.50 # High-accuracy similarity match threshold
+    HIGH_CONF_THRESH: float = 0.45 # High-accuracy similarity match threshold
     LOW_CONF_THRESH: float = 0.32
     MAX_EVAL_ATTEMPTS: int = 8      # Maximum clear evaluation attempts before locking Unknown
     DEDUP_SIM_THRESH: float = 0.95  # Vector similarity threshold to prune duplicate photos during enrollment
